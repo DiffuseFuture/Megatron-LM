@@ -36,6 +36,8 @@ from megatron.core.utils import (
 from .enums import AttnMaskType
 from .transformer_config import TransformerConfig
 
+from megatron.core.models.common.embeddings.rope_utils import rope_apply
+
 try:
     from einops import rearrange
 except ImportError:
@@ -1051,3 +1053,296 @@ class CrossAttention(Attention):
         query = query.view(*new_tensor_shape)
 
         return query, key, value
+
+
+
+
+
+
+class WanSelfAttention(Attention):
+    """Self-attention layer class
+
+    Self-attention layer takes input with size [s, b, h]
+    and returns output of the same size.
+    """
+
+    def __init__(
+        self,
+        config: TransformerConfig,
+        submodules: SelfAttentionSubmodules,
+        layer_number: int,
+        attn_mask_type=AttnMaskType.padding,
+        cp_comm_type: str = None,
+        model_comm_pgs: ModelCommProcessGroups = None,
+    ):
+        super().__init__(
+            config=config,
+            submodules=submodules,
+            layer_number=layer_number,
+            attn_mask_type=attn_mask_type,
+            attention_type="self",
+            cp_comm_type=cp_comm_type,
+            model_comm_pgs=model_comm_pgs,
+        )
+
+        self.linear_qkv = build_module(
+            submodules.linear_qkv,
+            self.config.hidden_size,
+            self.query_projection_size + 2 * self.kv_projection_size,
+            config=self.config,
+            init_method=self.config.init_method,
+            gather_output=False,
+            bias=self.config.add_bias_linear or self.config.add_qkv_bias,
+            skip_bias_add=False,
+            is_expert=False,
+            tp_comm_buffer_name='qkv',
+            tp_group=self.model_comm_pgs.tp,
+        )
+
+        if submodules.q_layernorm is not None:
+            self.q_layernorm = build_module(
+                submodules.q_layernorm,
+                hidden_size=self.hidden_size_per_attention_head,
+                config=self.config,
+                eps=self.config.layernorm_epsilon,
+            )
+        else:
+            self.q_layernorm = None
+
+        if submodules.k_layernorm is not None:
+            self.k_layernorm = build_module(
+                submodules.k_layernorm,
+                hidden_size=self.hidden_size_per_attention_head,
+                config=self.config,
+                eps=self.config.layernorm_epsilon,
+            )
+        else:
+            self.k_layernorm = None
+
+    def run_realtime_tests(self):
+        """Performs a consistency check.
+
+        This function makes sure that tensors across devices are the same during an experiment.
+        This is often not guaranteed to be so because of silent hardware failures (eg, memory
+        corruption loading a checkpoint, network traffic corruption encountered during
+        data transmission).
+
+        (TODO) In the future, more tensors should be checked across the training run and
+        checked every X iterations. This is left for future work. Equality of tensors is probably
+        not required; transmitting hashes is sufficient."""
+
+        if not self.config.qk_layernorm:
+            return
+
+        # check that all tensor parallel and data parallel ranks have the same
+        # Q & K layernorm parameters.
+        rank = get_data_parallel_rank()
+        inputs = torch.stack(
+            [
+                self.q_layernorm.weight.data,
+                self.q_layernorm.bias.data,
+                self.k_layernorm.weight.data,
+                self.k_layernorm.bias.data,
+            ]
+        )
+        dp_list = [torch.empty_like(inputs) for _ in range(get_data_parallel_world_size())]
+        dp_list[rank] = inputs
+        torch.distributed.all_gather(dp_list, inputs, group=get_data_parallel_group())
+
+        def _compare(srcs, tgts, names, parallelism):
+            assert len(srcs) == len(tgts) == len(names)
+            for src, tgt, name in zip(srcs, tgts, names):
+                assert torch.all(src == tgt), (
+                    f"Discrepancy between {name} in {parallelism} ranks {i} and {rank}. "
+                    f"Diff: {torch.norm(src - tgt)}"
+                )
+
+        for i, dp in enumerate(dp_list):
+            q_w, q_b, k_w, k_b = torch.unbind(dp)
+            _compare(
+                [q_w, q_b, k_w, k_b],
+                [
+                    self.q_layernorm.weight.data,
+                    self.q_layernorm.bias.data,
+                    self.k_layernorm.weight.data,
+                    self.k_layernorm.bias.data,
+                ],
+                ["q_w", "q_b", "k_w", "k_b"],
+                "DP",
+            )
+
+        rank = get_tensor_model_parallel_rank()
+        tp_list = [torch.empty_like(inputs) for _ in range(get_tensor_model_parallel_world_size())]
+        tp_list[rank] = inputs
+        torch.distributed.all_gather(tp_list, inputs, group=get_tensor_model_parallel_group())
+
+        for i, tp in enumerate(tp_list):
+            q_w, q_b, k_w, k_b = torch.unbind(tp)
+            _compare(
+                [q_w, q_b, k_w, k_b],
+                [
+                    self.q_layernorm.weight.data,
+                    self.q_layernorm.bias.data,
+                    self.k_layernorm.weight.data,
+                    self.k_layernorm.bias.data,
+                ],
+                ["q_w", "q_b", "k_w", "k_b"],
+                "TP",
+            )
+
+    def get_query_key_value_tensors(self, hidden_states, key_value_states=None):
+        """
+        Derives `query`, `key` and `value` tensors from `hidden_states`.
+        """
+        # Attention heads [sq, b, h] --> [sq, b, ng * (np/ng + 2) * hn)]
+        mixed_qkv, _ = self.linear_qkv(hidden_states)
+
+        # [sq, b, hp] --> [sq, b, ng, (np/ng + 2) * hn]
+        new_tensor_shape = mixed_qkv.size()[:-1] + (
+            self.num_query_groups_per_partition,
+            (
+                (self.num_attention_heads_per_partition // self.num_query_groups_per_partition + 2)
+                * self.hidden_size_per_attention_head
+            ),
+        )
+        mixed_qkv = mixed_qkv.view(*new_tensor_shape)
+
+        split_arg_list = [
+            (
+                self.num_attention_heads_per_partition
+                // self.num_query_groups_per_partition
+                * self.hidden_size_per_attention_head
+            ),
+            self.hidden_size_per_attention_head,
+            self.hidden_size_per_attention_head,
+        ]
+
+        if SplitAlongDim is not None:
+
+            # [sq, b, ng, (np/ng + 2) * hn]
+            # --> [sq, b, ng, np/ng * hn], [sq, b, ng, hn], [sq, b, ng, hn]
+            (query, key, value) = SplitAlongDim(mixed_qkv, 3, split_arg_list)
+        else:
+
+            # [sq, b, ng, (np/ng + 2) * hn]
+            # --> [sq, b, ng, np/ng * hn], [sq, b, ng, hn], [sq, b, ng, hn]
+            (query, key, value) = torch.split(mixed_qkv, split_arg_list, dim=3)
+
+        # [sq, b, ng, np/ng * hn] -> [sq, b, np, hn]
+        query = query.reshape(query.size(0), query.size(1), -1, self.hidden_size_per_attention_head)
+
+        if self.q_layernorm is not None:
+            query = self.q_layernorm(query)
+
+        if self.k_layernorm is not None:
+            key = self.k_layernorm(key)
+
+        if self.config.test_mode:
+            self.run_realtime_tests()
+
+        return query, key, value
+
+
+    def forward(
+        self,
+        hidden_states: Tensor,
+        attention_mask: Tensor,
+        freqs: Tensor,
+        packed_seq_params: Optional[PackedSeqParams] = None,
+    ) -> Tuple[Tensor, Tensor]:
+        """
+        Perform a forward pass through the attention module.
+
+        Args:
+            hidden_states (Tensor): Hidden states.
+            attention_mask (Tensor): Attention mask.
+            key_value_states (Optional[Tensor]): Key/value states (for cross attention).
+            inference_context (Optional[BaseInferenceContext]): Inference context that manages
+                KV cache.
+            rotary_pos_emb (Optional[Union[Tensor, Tuple[Tensor, Tensor]]]): Rotary
+                embedding tensor(s).
+            rotary_pos_cos (Optional[Tensor]): Rotary embedding cosine.
+            rotary_pos_sin (Optional[Tensor]): Rotary embedding sine.
+            attention_bias (Optional[Tensor]): Attention bias.
+            packed_seq_params (Optional[PackedSeqparams]): Parameters used for THD format.
+            sequence_len_offset (Optional[int]): Sequence length offset used for
+                inference CUDA graphs.
+
+        Return:
+            (Tuple[Tensor, Tensor]) Attention output and bias.
+
+        """
+        # Check if we need to skip RoPE
+        # no_rope is 0-indexed array and self.layer_number is 1-indexed
+        no_rope = (
+            self.config.no_rope_freq[self.layer_number - 1] if self.config.no_rope_freq else False
+        )
+        if no_rope:
+            rotary_pos_emb = None
+
+
+
+        # For self attention we just duplicate the rotary_pos_emb if it isn't already
+        if rotary_pos_emb is not None and not isinstance(rotary_pos_emb, tuple):
+            rotary_pos_emb = (rotary_pos_emb,) * 2
+
+        # =====================
+        # Query, Key, and Value
+        # =====================
+        # Get the query, key and value tensors based on the type of attention -
+        # self or cross attn.
+        nvtx_range_push(suffix="qkv")
+        query, key, value = self.get_query_key_value_tensors(hidden_states, None)
+        nvtx_range_pop(suffix="qkv")
+
+        # ===================================================
+        # Adjust key, value, and rotary_pos_emb for inference
+        # ===================================================
+
+        query = rope_apply(query, freqs)
+        key = rope_apply(key, freqs)
+
+
+        # ==================================
+        # core attention computation
+        # ==================================
+
+        nvtx_range_push(suffix="core_attention")
+        if self.checkpoint_core_attention and self.training:
+            core_attn_out = self._checkpointed_attention_forward(
+                query,
+                key,
+                value,
+                attention_mask,
+                attn_mask_type=self.attn_mask_type,
+                packed_seq_params=packed_seq_params,
+            )
+        else:
+            # Static batching attention kernel.
+            core_attn_out = self.core_attention(
+                query,
+                key,
+                value,
+                attention_mask,
+                attn_mask_type=self.attn_mask_type,
+                packed_seq_params=packed_seq_params,
+            )
+
+
+        if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
+            # reshape to same output shape as unpacked case
+            # (t, np, hn) -> (t, b=1, h=np*hn)
+            # t is the pack size = sum (sq_i)
+            # note that batch is a dummy dimension in the packed case
+            core_attn_out = core_attn_out.reshape(core_attn_out.size(0), 1, -1)
+        nvtx_range_pop(suffix="core_attention")
+
+        # =================
+        # Output. [sq, b, h]
+        # =================
+
+        nvtx_range_push(suffix="linear_proj")
+        output, bias = self.linear_proj(core_attn_out)
+        nvtx_range_pop(suffix="linear_proj")
+
+        return output, bias
