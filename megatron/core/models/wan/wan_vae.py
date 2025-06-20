@@ -16,13 +16,17 @@ from megatron.core.transformer.module import MegatronModule
 
 CACHE_T = 2
 
-class CausalConv3d(torch.nn.Conv3d):
-    def __init(self, *args, **kwargs):
+class CausalConv3d(nn.Conv3d):
+    """
+    Causal 3d convolusion.
+    """
+
+    def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self._padding = (self.padding[2], self.padding[2], self.padding[1],
                          self.padding[1], 2 * self.padding[0], 0)
-        self.padding = (0, 0, 0) # 防止父类的padding操作影响结果
-    
+        self.padding = (0, 0, 0)
+
     def forward(self, x, cache_x=None):
         padding = list(self._padding)
         if cache_x is not None and self._padding[4] > 0:
@@ -695,8 +699,8 @@ class AutoencoderKLWan(ModelMixin, ConfigMixin, FromOriginalModelMixin):
         return model
 
 class WanVae(MegatronModule):
-    def __init__(self, pretrained_model_path, additional_kwargs={}):
-        super().__init__()
+    def __init__(self, config, pretrained_model_path, additional_kwargs={}):
+        super().__init__(config)
         if pretrained_model_path is not None:
             self.vae = AutoencoderKLWan.from_pretrained(pretrained_model_path)
         else:
