@@ -5,6 +5,7 @@
 import datetime
 import os
 import torch
+import copy
 
 from functools import partial
 from typing import List, Optional, Tuple, Union
@@ -19,21 +20,28 @@ from megatron.core.enums import ModelType
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
 from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, MockGPTDataset
 from megatron.core.enums import ModelType
-from megatron.core.models.gpt import GPTModel
-from megatron.core.models.gpt.gpt_layer_specs import (
-    get_gpt_decoder_block_spec,
-    get_gpt_layer_local_spec,
-    get_gpt_layer_with_transformer_engine_spec,
-    get_gpt_mtp_block_spec,
+from megatron.core.transformer.module import Float16Module
+
+from megatron.core.models.VideoX_Fun.transformer3d_layer_specs import (
+    get_transformer3d_layer_local_spec,
 )
-from megatron.core.models.gpt.heterogeneous.heterogeneous_layer_specs import (
-    get_gpt_heterogeneous_layer_spec,
+
+from megatron.core.models.T5.t5_spec import (
+    get_t5_encoder_with_transformer_engine_block_spec,
+    get_t5_encoder_with_local_block_spec,
 )
+
+from megatron.core.models.VideoX_Fun import WanTransformer3DModel
+from megatron.core.models.T5 import T5Model
+
+# from megatron.core.models.gpt.heterogeneous.heterogeneous_layer_specs import (
+#     get_gpt_heterogeneous_layer_spec,
+# )
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.transformer.spec_utils import import_module
 from megatron.core.utils import StragglerDetector
 from megatron.training import get_args, get_timers, get_tokenizer, pretrain, print_rank_0
-from megatron.training.arguments import core_transformer_config_from_args
+from megatron.training.arguments import core_transformer3d_config_from_args
 from megatron.training.utils import (
     get_batch_on_this_cp_rank,
     get_batch_on_this_tp_rank,
@@ -57,9 +65,14 @@ except ImportError:
 stimer = StragglerDetector()
 
 
+t5_model = None
+dit_model = None
+
+
+
 def model_provider(
     pre_process=True, post_process=True, vp_stage: Optional[int] = None
-) -> Union[GPTModel, megatron.legacy.model.GPTModel]:
+) -> Union[WanTransformer3DModel]:
     """Builds the model.
 
     If you set the use_legacy_models to True, it will return the legacy GPT model and if not the mcore GPT model.
@@ -77,7 +90,7 @@ def model_provider(
     if has_nvidia_modelopt and modelopt_args_enabled(args):  # [ModelOpt]
         return model_provider_modelopt(pre_process, post_process)
 
-    use_te = args.transformer_impl == "transformer_engine"
+    # use_te = args.transformer_impl == "transformer_engine"
 
     if args.record_memory_history:
         torch.cuda.memory._record_memory_history(
@@ -101,61 +114,27 @@ def model_provider(
 
         torch._C._cuda_attach_out_of_memory_observer(oom_observer)
 
-    print_rank_0('building GPT model ...')
+    
+    print_rank_0('building WanTransformer3D model ...')
     # Experimental loading arguments from yaml
-    if args.yaml_cfg is not None:
-        config = core_transformer_config_from_yaml(args, "language_model")
-    else:
-        config = core_transformer_config_from_args(args)
+    config = core_transformer3d_config_from_args(args)
 
-    if args.use_legacy_models:
-        model = megatron.legacy.model.GPTModel(
-            config,
-            num_tokentypes=0,
-            parallel_output=True,
-            pre_process=pre_process,
-            post_process=post_process,
+    if parallel_state.is_pipeline_first_stage():
+        
+        t5_config = copy.deepcopy(config)
+        encoder_config = copy.deepcopy(config)
+
+        en_block_spec = get_t5_encoder_with_local_block_spec(
+            config.num_layers
         )
-    else:  # using core models
-        if args.spec is not None:
-            transformer_layer_spec = import_module(args.spec)
-        else:
-            if args.num_experts:
-                # Define the decoder block spec
-                transformer_layer_spec = get_gpt_decoder_block_spec(
-                    config, use_transformer_engine=use_te, normalization=args.normalization, qk_l2_norm=args.qk_l2_norm, vp_stage=vp_stage
-                )
-            elif args.heterogeneous_layers_config_path is not None:
-                transformer_layer_spec = get_gpt_heterogeneous_layer_spec(config, use_te)
-            else:
-                # Define the decoder layer spec
-                if use_te:
-                    transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
-                        args.num_experts,
-                        args.moe_grouped_gemm,
-                        args.qk_layernorm,
-                        args.multi_latent_attention,
-                        args.moe_use_legacy_grouped_gemm,
-                        qk_l2_norm=args.qk_l2_norm
-                    )
-                else:
-                    transformer_layer_spec = get_gpt_layer_local_spec(
-                        args.num_experts,
-                        args.moe_grouped_gemm,
-                        args.qk_layernorm,
-                        args.multi_latent_attention,
-                        args.moe_use_legacy_grouped_gemm,
-                        normalization=args.normalization,
-                    )
-        mtp_block_spec = None
-        if args.mtp_num_layers is not None:
-            mtp_block_spec = get_gpt_mtp_block_spec(
-                config, transformer_layer_spec, use_transformer_engine=use_te, vp_stage=vp_stage
-            )
 
-        model = GPTModel(
-            config=config,
-            transformer_layer_spec=transformer_layer_spec,
+        global t5_model
+        
+        t5_model = T5Model(
+            config=t5_config,
+            encoder_config=encoder_config,
+            transformer_encoder_layer_spec=en_block_spec,
+            transformer_decoder_layer_spec=None,
             vocab_size=args.padded_vocab_size,
             max_sequence_length=args.max_position_embeddings,
             pre_process=pre_process,
@@ -165,13 +144,38 @@ def model_provider(
             share_embeddings_and_output_weights=not args.untie_embeddings_and_output_weights,
             position_embedding_type=args.position_embedding_type,
             rotary_percent=args.rotary_percent,
-            rotary_base=args.rotary_base,
-            rope_scaling=args.use_rope_scaling,
-            mtp_block_spec=mtp_block_spec,
-            vp_stage=vp_stage,
+            relative_attention_num_buckets=args.relative_attention_num_buckets,
+            relative_attention_max_distance=args.relative_attention_max_distance,
+            add_encoder=True,
+            add_decoder=False,
         )
+        t5_model.cuda(torch.cuda.current_device())
+        t5_model = Float16Module(t5_config, t5_model)
 
-    return model
+    
+    transformer_layer_spec = get_transformer3d_layer_local_spec()
+
+    global dit_model
+    dit_model = WanTransformer3DModel(
+        config=config,
+        transformer_layer_spec=transformer_layer_spec,
+        vocab_size=args.padded_vocab_size,
+        max_sequence_length=args.max_position_embeddings,
+        pre_process=pre_process,
+        post_process=post_process,
+        fp16_lm_cross_entropy=args.fp16_lm_cross_entropy,
+        parallel_output=True,
+        share_embeddings_and_output_weights=not args.untie_embeddings_and_output_weights,
+        position_embedding_type=args.position_embedding_type,
+        rotary_percent=args.rotary_percent,
+        rotary_base=args.rotary_base,
+        rope_scaling=args.use_rope_scaling,
+        mtp_block_spec=None,
+        vp_stage=vp_stage,
+    )
+
+    # return [t5_model, dit_model]
+    return dit_model
 
 
 def get_batch(data_iterator):
@@ -197,7 +201,7 @@ SPIKY_LOSS_FACTOR = 10
 
 
 def loss_func(
-    loss_mask: torch.Tensor, output_tensor: torch.Tensor, model: Optional[GPTModel] = None
+    loss_mask: torch.Tensor, output_tensor: torch.Tensor, model: Optional[WanTransformer3DModel] = None
 ):
     """Loss function.
 
@@ -218,8 +222,9 @@ def loss_func(
         return loss_func_modelopt(loss_mask, output_tensor, model=model)
 
     losses = output_tensor.view(-1).float()
-    loss_mask = loss_mask.view(-1).float()
-    loss = torch.sum(losses * loss_mask)
+    # loss_mask = loss_mask.view(-1).float()
+    # loss = torch.sum(losses * loss_mask)
+    loss = torch.sum(losses)
 
     # Check individual rank losses are not NaN prior to DP all-reduce.
     rerun_state_machine = get_rerun_state_machine()
@@ -258,7 +263,7 @@ def loss_func(
     return (loss, num_tokens, {'lm loss': reporting_loss})
 
 
-def forward_step(data_iterator, model: GPTModel):
+def forward_step(data_iterator, model: WanTransformer3DModel):
     """Forward training step.
 
     Args:
@@ -275,13 +280,33 @@ def forward_step(data_iterator, model: GPTModel):
         tokens, labels, loss_mask, attention_mask, position_ids = get_batch(data_iterator)
     timers('batch-generator').stop()
 
+    
     with stimer:
-        if args.use_legacy_models:
-            output_tensor = model(tokens, position_ids, attention_mask, labels=labels)
+        if(tokens is not None):
+            device = tokens.device
+            print("type", tokens.dtype)
+            x = torch.randn(1, 16, 6, 90, 156, device=device, dtype=torch.float16)
+            t = torch.tensor([0], device=device)  # 假设 t 是时间步长标记之类的
+            context = [torch.randn(209, 512, device=device, dtype=torch.float16)]
+            seqlen = 21060  # 这是个整数，不用放 device 上
+            y = torch.randn(1, 20, 6, 90, 156, device=device, dtype=torch.float16)
+            clip_fea = torch.randn(1, 257, 1280, device=device, dtype=torch.float16)
         else:
-            output_tensor = model(
-                tokens, position_ids, attention_mask, labels=labels, loss_mask=loss_mask
-            )
+            x = None
+            t = torch.tensor([0]).cuda()  # 假设 t 是时间步长标记之类的
+            context = None
+            seqlen = None
+            clip_fea = None
+            y = None
+        # print("start fwd")
+        if parallel_state.is_pipeline_first_stage():
+            context_ids = torch.ones((1, 209), dtype=torch.int64).cuda()
+            causal_mask = torch.tril(torch.ones((1, 209, 209), device=context_ids.device, dtype=torch.bool))
+            t5_model.eval()
+            context = t5_model(context_ids, None, causal_mask, None, None)
+            context = context.transpose(0, 1).contiguous()
+            context = [c for c in context]
+        output_tensor = model(x, t, context, seqlen, attention_mask, clip_fea, y)
 
     # [ModelOpt]: model is needed to access ModelOpt distillation losses
     return output_tensor, partial(loss_func, loss_mask, model=model)

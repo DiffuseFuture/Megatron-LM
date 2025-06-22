@@ -301,6 +301,7 @@ class T5Model(LanguageModule):
         Returns:
             Tensor: loss tensor
         """
+        print("t5 start fwd")
 
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
@@ -312,9 +313,15 @@ class T5Model(LanguageModule):
 
             # Encoder embedding.
             if self.pre_process:
+                print("encoder_input_ids", encoder_input_ids.device)
+                print("encoder_position_ids", encoder_position_ids.device)
+                print("config.hidden_size", self.config.hidden_size)
+                print("encoder_input_ids shape", encoder_input_ids.shape)
                 encoder_input = self.embedding(
                     input_ids=encoder_input_ids, position_ids=encoder_position_ids
                 )
+                print("encoder_input shape", encoder_input.shape)
+                print("encoder_input type", encoder_input.dtype)
             else:
                 # intermediate stage of pipeline
                 encoder_input = None
@@ -362,6 +369,7 @@ class T5Model(LanguageModule):
             else:
                 encoder_hidden_states = self.encoder_hidden_state
 
+        print("self.add_decoder", self.add_decoder)
         if not self.add_decoder or output_encoder_hidden_only:
             return encoder_hidden_states
 

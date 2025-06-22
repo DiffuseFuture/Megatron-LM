@@ -1102,9 +1102,8 @@ class WanSelfAttention(Attention):
         if submodules.q_layernorm is not None:
             self.q_layernorm = build_module(
                 submodules.q_layernorm,
-                hidden_size=self.hidden_size_per_attention_head,
                 config=self.config,
-                eps=self.config.layernorm_epsilon,
+                hidden_size=self.hidden_size_per_attention_head,
             )
         else:
             self.q_layernorm = None
@@ -1112,9 +1111,8 @@ class WanSelfAttention(Attention):
         if submodules.k_layernorm is not None:
             self.k_layernorm = build_module(
                 submodules.k_layernorm,
-                hidden_size=self.hidden_size_per_attention_head,
                 config=self.config,
-                eps=self.config.layernorm_epsilon,
+                hidden_size=self.hidden_size_per_attention_head,
             )
         else:
             self.k_layernorm = None
@@ -1195,7 +1193,9 @@ class WanSelfAttention(Attention):
         Derives `query`, `key` and `value` tensors from `hidden_states`.
         """
         # Attention heads [sq, b, h] --> [sq, b, ng * (np/ng + 2) * hn)]
+        print("hidden_states", hidden_states.dtype, hidden_states.shape)
         mixed_qkv, _ = self.linear_qkv(hidden_states)
+        print("mixed_qkv", mixed_qkv.shape)
 
         # [sq, b, hp] --> [sq, b, ng, (np/ng + 2) * hn]
         new_tensor_shape = mixed_qkv.size()[:-1] + (
@@ -1205,6 +1205,7 @@ class WanSelfAttention(Attention):
                 * self.hidden_size_per_attention_head
             ),
         )
+        print("new_tensor_shape", new_tensor_shape)
         mixed_qkv = mixed_qkv.view(*new_tensor_shape)
 
         split_arg_list = [
@@ -1230,6 +1231,7 @@ class WanSelfAttention(Attention):
 
         # [sq, b, ng, np/ng * hn] -> [sq, b, np, hn]
         query = query.reshape(query.size(0), query.size(1), -1, self.hidden_size_per_attention_head)
+        
 
         if self.q_layernorm is not None:
             query = self.q_layernorm(query)
@@ -1272,19 +1274,9 @@ class WanSelfAttention(Attention):
             (Tuple[Tensor, Tensor]) Attention output and bias.
 
         """
-        # Check if we need to skip RoPE
-        # no_rope is 0-indexed array and self.layer_number is 1-indexed
-        no_rope = (
-            self.config.no_rope_freq[self.layer_number - 1] if self.config.no_rope_freq else False
-        )
-        if no_rope:
-            rotary_pos_emb = None
 
 
 
-        # For self attention we just duplicate the rotary_pos_emb if it isn't already
-        if rotary_pos_emb is not None and not isinstance(rotary_pos_emb, tuple):
-            rotary_pos_emb = (rotary_pos_emb,) * 2
 
         # =====================
         # Query, Key, and Value
@@ -1292,6 +1284,7 @@ class WanSelfAttention(Attention):
         # Get the query, key and value tensors based on the type of attention -
         # self or cross attn.
         nvtx_range_push(suffix="qkv")
+        print("hidden_states shape", hidden_states.shape)
         query, key, value = self.get_query_key_value_tensors(hidden_states, None)
         nvtx_range_pop(suffix="qkv")
 

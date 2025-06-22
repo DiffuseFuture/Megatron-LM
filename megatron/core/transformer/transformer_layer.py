@@ -309,8 +309,7 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         self.input_layernorm = build_module(
             submodules.input_layernorm,
             config=self.config,
-            hidden_size=self.config.hidden_size,
-            eps=self.config.layernorm_epsilon,
+            hidden_size=config.hidden_size,
         )
 
         attention_optional_kwargs = {}
@@ -356,8 +355,7 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         self.pre_mlp_layernorm = build_module(
             submodules.pre_mlp_layernorm,
             config=self.config,
-            hidden_size=self.config.hidden_size,
-            eps=self.config.layernorm_epsilon,
+            hidden_size=config.hidden_size
         )
         # [Module 8: MLP block]
         additional_mlp_kwargs = {}
@@ -498,6 +496,10 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
 
         # Self attention.
         nvtx_range_push(suffix="self_attention")
+        print("input_layernorm_output", input_layernorm_output.shape)
+        print("attention_mask", attention_mask.shape)
+        print("packed_seq_params", packed_seq_params)
+        print("sequence_len_offset", sequence_len_offset)
         attention_output_with_bias = self.self_attention(
             input_layernorm_output,
             attention_mask=attention_mask,
@@ -897,6 +899,8 @@ class Transformer3dLayer(MegatronModule, BaseTransformerLayer):
     ):
         super().__init__(config=config)
 
+        print("layer number", layer_number)
+
         # Enable cuda graphs.
         if config.enable_cuda_graph or config.external_cuda_graph:
             assert not (
@@ -936,8 +940,7 @@ class Transformer3dLayer(MegatronModule, BaseTransformerLayer):
         self.input_layernorm = build_module(
             submodules.input_layernorm,
             config=self.config,
-            hidden_size=self.config.hidden_size,
-            eps=self.config.layernorm_epsilon,
+            hidden_size=config.hidden_size,
         )
 
         attention_optional_kwargs = {}
@@ -983,8 +986,7 @@ class Transformer3dLayer(MegatronModule, BaseTransformerLayer):
         self.pre_mlp_layernorm = build_module(
             submodules.pre_mlp_layernorm,
             config=self.config,
-            hidden_size=self.config.hidden_size,
-            eps=self.config.layernorm_epsilon,
+            hidden_size=config.hidden_size,
         )
         # [Module 8: MLP block]
         additional_mlp_kwargs = {}
@@ -1074,6 +1076,7 @@ class Transformer3dLayer(MegatronModule, BaseTransformerLayer):
         e: Tensor,
         attention_mask: Optional[Tensor] = None,
         context: Optional[Tensor] = None,
+        freqs: Optional[Tensor] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
     ):
         """
@@ -1116,16 +1119,20 @@ class Transformer3dLayer(MegatronModule, BaseTransformerLayer):
                 self.input_layernorm, hidden_states
             )
         else:
+            print("hidden_states before norm", hidden_states.dtype, hidden_states.shape)
             input_layernorm_output = self.input_layernorm(hidden_states)
+            print("hidden_states after norm", input_layernorm_output.dtype, hidden_states.shape)
         
-
+        print("hidden_states after norm0", input_layernorm_output.dtype, input_layernorm_output.shape)
         input_layernorm_output = input_layernorm_output * (1 + e[1]) + e[0]
+        print("hidden_states after norm1", input_layernorm_output.dtype, input_layernorm_output.shape)
 
         # Self attention.
         nvtx_range_push(suffix="self_attention")
         attention_output_with_bias = self.self_attention(
             input_layernorm_output,
             attention_mask=attention_mask,
+            freqs = freqs,
             packed_seq_params=packed_seq_params,
         )
         nvtx_range_pop(suffix="self_attention")

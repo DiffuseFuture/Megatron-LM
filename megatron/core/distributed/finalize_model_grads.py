@@ -273,6 +273,7 @@ def finalize_model_grads(model: List[torch.nn.Module], num_tokens: Optional[torc
     if config.timers is not None:
         config.timers('all-grads-sync').stop()
 
+    print("t_embedder start")
     # All-reduce t_embedder grads (for pp & vpp of DiT).
     if config.timers is not None:
         config.timers('conditional-embedder-grads-all-reduce', log_level=1).start(
@@ -281,6 +282,7 @@ def finalize_model_grads(model: List[torch.nn.Module], num_tokens: Optional[torc
     _allreduce_conditional_embedding_grads(model, config)
     if config.timers is not None:
         config.timers('conditional-embedder-grads-all-reduce').stop()
+    print("t_embedder done")
 
     # All-reduce layer-norm grads (for sequence parallelism).
     if config.timers is not None:
@@ -292,6 +294,7 @@ def finalize_model_grads(model: List[torch.nn.Module], num_tokens: Optional[torc
         config.timers('layernorm-grads-all-reduce').stop()
 
     # All-reduce embedding grads (for pipeline parallelism).
+    print("start embedding")
     if config.timers is not None:
         config.timers('embedding-grads-all-reduce', log_level=1).start(
             barrier=config.barrier_with_L1_time
@@ -299,10 +302,15 @@ def finalize_model_grads(model: List[torch.nn.Module], num_tokens: Optional[torc
     _allreduce_embedding_grads(model, config)
     if config.timers is not None:
         config.timers('embedding-grads-all-reduce').stop()
+    print("end embedding")
 
+    print("0")
     if config.moe_router_enable_expert_bias:
         _update_router_expert_bias(model, config)
+    print("1")
 
+    print("num_tokens", num_tokens)
+    
     # normalize gradients for per-token loss normalization.
     # if we are using by the number of tokens, then we use that as a divisor. this number
     # will be the total number of non-padded tokens in the global batch.

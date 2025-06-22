@@ -220,7 +220,7 @@ def _get_block_submodules(
         elif issubclass(spec.module, BaseTransformerLayer):
             num_layers = get_num_layers_to_build(config, vp_stage)
             return TransformerBlockSubmodules(
-                layer_specs=[spec] * num_layers, layer_norm=LayerNormImpl
+                layer_specs=[spec] * num_layers, layer_norm=None
             )
         else:
             raise Exception(f"specialize for {spec.module.__name__}.")
@@ -327,8 +327,7 @@ class TransformerBlock(MegatronModule):
             self.final_layernorm = build_module(
                 self.submodules.layer_norm,
                 config=self.config,
-                hidden_size=self.config.hidden_size,
-                eps=self.config.layernorm_epsilon,
+                hidden_size=self.config.hidden_size
             )
         else:
             self.final_layernorm = None  # Either this or nn.Identity
@@ -749,16 +748,16 @@ class Transformer3DBlock(MegatronModule):
                 for i, layer_spec in enumerate(self.submodules.layer_specs)
             ]
         )
-
+        
         # @TODO: add back account_for_embedding_in_pipeline_split (see issue #293)
         # In pipeline parallelism, we want to add this LN only to the last stage of the pipeline
         # self.post_process and self.post_layer_norm guide this behavior
+        #print("self.submodules.layer_norm", self.submodules.layer_norm)
         if self.submodules.layer_norm and self.post_process and self.post_layer_norm:
             self.final_layernorm = build_module(
                 self.submodules.layer_norm,
                 config=self.config,
-                hidden_size=self.config.hidden_size,
-                eps=self.config.layernorm_epsilon,
+                hidden_size=self.config.hidden_size
             )
         else:
             self.final_layernorm = None  # Either this or nn.Identity
@@ -930,15 +929,20 @@ class Transformer3DBlock(MegatronModule):
             [s, b, h], and optionally the updated context tensor if cross-attention is used.
         """
 
-        inference_context = deprecate_inference_params(inference_context, inference_params)
+        # inference_context = deprecate_inference_params(inference_context, inference_params)
 
         # Delete the obsolete reference to the initial input tensor if necessary
+
+        #print("hidden_states0 dtype", hidden_states.dtype, hidden_states.shape)
         if isinstance(hidden_states, WrappedTensor):
             hidden_states = hidden_states.unwrap()
 
+        #print("hidden_states1 dtype", hidden_states.dtype, hidden_states.shape)
         if not self.pre_process:
             # See set_input_tensor()
             hidden_states = self.input_tensor
+
+        #print("hidden_states2 dtype", hidden_states.dtype, hidden_states.shape)
 
         # Viewless tensor.
         # - We only need to create a viewless tensor in the case of micro batch
@@ -996,6 +1000,7 @@ class Transformer3DBlock(MegatronModule):
                             e=e,
                             attention_mask=attention_mask,
                             context=context,
+                            freqs=freqs,
                             packed_seq_params=packed_seq_params,
                             # sequence_len_offset=sequence_len_offset,
                         )

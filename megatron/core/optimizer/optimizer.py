@@ -1183,13 +1183,16 @@ class ChainedOptimizer(MegatronOptimizer):
     @torch.no_grad()
     def step(self):
         """ChainedOptimizer will step all optimizers one by one."""
+        print("step")
         found_inf_flag = self.prepare_grads()
         if found_inf_flag:
             return False, None, None
 
+        print("0")
         grad_norm = self.get_grad_norm()
 
         # Clip gradients.
+        print("1")
         for optimizer in self.chained_optimizers:
             if hasattr(optimizer, 'is_stub_optimizer') and optimizer.is_stub_optimizer:
                 continue
@@ -1200,10 +1203,10 @@ class ChainedOptimizer(MegatronOptimizer):
                     total_norm=grad_norm,
                     use_decoupled_grad=optimizer.config.use_precision_aware_optimizer,
                 )
-
+        print("2")
         # Count the zeros in the grads.
         num_zeros_in_grad = self.count_zeros() if self.config.log_num_zeros_in_grad else None
-
+        print("3")
         update_successful = self.step_with_ready_grads()
 
         return update_successful, grad_norm, num_zeros_in_grad

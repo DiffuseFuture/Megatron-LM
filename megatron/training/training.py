@@ -1405,9 +1405,11 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
 
     # Update parameters.
 
+    print("start optimizer step")
     timers('optimizer', log_level=1).start(barrier=args.barrier_with_L1_time)
     update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
     timers('optimizer').stop()
+    print("start optimizer done")
 
     # when freezing sub-models we may have a mixture of successful and unsucessful ranks,
     # so we must gather across mp ranks
