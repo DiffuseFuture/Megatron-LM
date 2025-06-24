@@ -1378,13 +1378,17 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
             adjust_tensor_shapes_fn = None
 
         # Forward pass.
+        args.hidden_state_seqlen = 21060
+        args.context_seqlen = 769
         forward_backward_func = get_forward_backward_func()
         losses_reduced = forward_backward_func(
             forward_step_func=forward_step_func,
             data_iterator=data_iterator,
             model=model,
             num_microbatches=get_num_microbatches(),
-            seq_length=args.seq_length,
+            # seq_length=args.seq_length,
+            seq_length=args.hidden_state_seqlen,
+            context_seq_length=args.context_seqlen,
             micro_batch_size=args.micro_batch_size,
             decoder_seq_length=args.decoder_seq_length,
             forward_only=False,
@@ -2447,12 +2451,15 @@ def evaluate(
             # Don't care about timing during evaluation
             config.timers = None
             ft_integration.on_eval_step_start()
+            args.hidden_state_seqlen = 21060
+            args.context_seqlen = 769
             loss_dicts = forward_backward_func(
                 forward_step_func=forward_step_func,
                 data_iterator=data_iterator,
                 model=model,
                 num_microbatches=eval_num_microbatches,
-                seq_length=args.seq_length,
+                seq_length=args.hidden_state_seqlen,
+                context_seq_length=args.context_seqlen,
                 micro_batch_size=args.micro_batch_size,
                 decoder_seq_length=args.decoder_seq_length,
                 forward_only=True,

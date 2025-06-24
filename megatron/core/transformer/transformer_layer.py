@@ -309,8 +309,7 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         self.input_layernorm = build_module(
             submodules.input_layernorm,
             config=self.config,
-            hidden_size=self.config.hidden_size,
-            eps=self.config.layernorm_epsilon,
+            hidden_size=config.hidden_size,
         )
 
         attention_optional_kwargs = {}
@@ -356,8 +355,7 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
         self.pre_mlp_layernorm = build_module(
             submodules.pre_mlp_layernorm,
             config=self.config,
-            hidden_size=self.config.hidden_size,
-            eps=self.config.layernorm_epsilon,
+            hidden_size=config.hidden_size
         )
         # [Module 8: MLP block]
         additional_mlp_kwargs = {}
@@ -425,6 +423,8 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
             "Please use get_transformer_layer_offset instead."
         )
         return get_transformer_layer_offset(config)
+
+
 
     def forward(self, *args, **kwargs):
         """
@@ -544,10 +544,10 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
 
         # TODO: could we move `bias_dropout_add_exec_handler` itself
         # inside the module provided in the `bias_dropout_add_spec` module?
-        with self.bias_dropout_add_exec_handler():
-            hidden_states = self.cross_attn_bda(self.training, self.config.bias_dropout_fusion)(
-                attention_output_with_bias, residual, self.hidden_dropout
-            )
+        # with self.bias_dropout_add_exec_handler():
+        #     hidden_states = self.cross_attn_bda(self.training, self.config.bias_dropout_fusion)(
+        #         attention_output_with_bias, residual, self.hidden_dropout
+        #     )
 
         # Residual connection.
         residual = hidden_states
@@ -632,6 +632,625 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
                 mlp_output_with_bias, residual, self.hidden_dropout
             )
         nvtx_range_pop(suffix="mlp_bda")
+
+        # Jit compiled function creates 'view' tensor. This tensor
+        # potentially gets saved in the MPU checkpoint function context,
+        # which rejects view tensors. While making a viewless tensor here
+        # won't result in memory savings (like the data loader, or
+        # p2p_communication), it serves to document the origin of this
+        # 'view' tensor.
+        output = make_viewless_tensor(
+            inp=hidden_states, requires_grad=hidden_states.requires_grad, keep_graph=True
+        )
+
+        return output
+
+    def sharded_state_dict(
+        self, prefix: str = '', sharded_offsets: tuple = (), metadata: Optional[dict] = None
+    ) -> ShardedStateDict:
+        """
+        Generate a sharded state dictionary for the transformer layer.
+
+        Args:
+            prefix (str, optional): Prefix to be added to all keys in the state dict.
+            sharded_offsets (tuple, optional): Tuple of sharding offsets.
+            metadata (Optional[dict], optional): Additional metadata for sharding.
+
+        Returns:
+            ShardedStateDict: A dictionary containing the sharded state of the transformer layer.
+        """
+        sharded_state_dict = super().sharded_state_dict(prefix, sharded_offsets, metadata)
+        prefixed_map = {
+            f'{prefix}{k}': f'{prefix}{v}'
+            for k, v in self.submodules_config.sharded_state_dict_keys_map.items()
+        }
+        if prefixed_map:
+            apply_prefix_mapping(sharded_state_dict, prefixed_map)
+        return sharded_state_dict
+
+    def get_layer_static_inputs(self, seq_length, micro_batch_size):
+        """
+        Get the static inputs for the transformer layer.
+
+        Returns:
+            Dict[str, torch.Tensor]: A dictionary containing the static inputs for the layer.
+        """
+        # Calculate data shape related values.
+        context_parallel_size = self.config.context_parallel_size
+        slen_per_cp = seq_length // context_parallel_size
+        sequence_parallel = self.config.sequence_parallel
+        tensor_model_parallel_size = self.config.tensor_model_parallel_size
+        slen_per_cptp = (
+            slen_per_cp // tensor_model_parallel_size if sequence_parallel else slen_per_cp
+        )
+
+        static_inputs = {}
+        static_inputs["hidden_states"] = torch.ones(
+            (slen_per_cptp, micro_batch_size, self.config.hidden_size),
+            dtype=torch.bfloat16,
+            requires_grad=True,
+            device=torch.cuda.current_device(),
+        )
+        static_inputs["attention_mask"] = (
+            ~(torch.tril(torch.ones((slen_per_cp, seq_length))).bool())
+            .to(torch.cuda.current_device())
+            .reshape(1, 1, slen_per_cp, seq_length)
+            .tile(micro_batch_size, 1, 1, 1)
+        )
+        return static_inputs
+
+    def setup_manual_hooks(self, make_hook_func):
+        """
+        Set CUDA Graph manual hooks for the modules that contain direct parameters and are
+        covered by cudagraphs.
+        """
+        self.cuda_graph_manual_hooks = []
+
+        # Select the modules who contain direct parameters and are covered by cudagraphs.
+        # Add these modules to the `cuda_graph_manual_hooks` because their hooks will not
+        # be automatically triggered when they go through the CUDA Graph path.
+        if self.config.cuda_graph_scope == 'full':
+            high_level_modules = [self]
+        else:
+            assert (
+                self.config.cuda_graph_scope == 'attn'
+            ), "Invalid cuda_graph_scope ${self.config.cuda_graph_scope}"
+            high_level_modules = [
+                self.input_layernorm,
+                self.self_attention,
+                self.pre_cross_attn_layernorm,
+                self.cross_attention,
+                self.pre_mlp_layernorm,
+            ]
+
+        param_modules = []
+        for module in high_level_modules:
+            for submodule in module.modules():
+                if next(submodule.parameters(recurse=False), None) is not None:
+                    # Module contains direct parameters.
+                    param_modules.append(submodule)
+                    continue
+        if len(param_modules) > 0:
+            for module in param_modules:
+                self.cuda_graph_manual_hooks.append((make_hook_func(), (module,)))
+
+    def _cuda_graph_capture(self, *args, **kwargs):
+        """
+        CUDA Graph capture for this layer. There are some differences from the normal pass:
+        1. In some conditions CUDA graph cannot cover the entire layer. The `cuda_graph_scope`
+           attribute can be set to control the scope of the CUDA graph.
+        2. If context is None, it cannot be returned as output.
+        """
+        pre_mlp_layernorm_output, residual, context = self._forward_attention(*args, **kwargs)
+
+        cuda_graph_outputs = []
+        if self.config.cuda_graph_scope == "attn":
+            cuda_graph_outputs += [pre_mlp_layernorm_output, residual]
+        else:
+            output = self._forward_mlp(pre_mlp_layernorm_output, residual)
+            cuda_graph_outputs.append(output)
+        if context is not None:
+            cuda_graph_outputs.append(context)
+        return tuple(cuda_graph_outputs)
+
+    def _cuda_graph_replay(self, *args, **kwargs):
+        """
+        CUDA graph replay for this layer and microbatch
+        `self.current_microbatch`. TransformerEngine versions>=1.10
+        allow keyword arguments with CUDA graph. However, CUDA graph
+        acccepts only Tensor inputs and Tensor outputs. Hence,
+        `inference_context` and `packed_seq_params` are excluded from
+        input list while output is limited to `hidden_states`.
+        """
+
+        def _check_cuda_graph_replay_args(*args, **kwargs):
+            """Helper function to get optional tensor arguments for CUDA graph."""
+
+            assert len(args) <= 1, "At most one positional argument `hidden_states` is expected."
+            if len(args) == 1:
+                hidden_states = args[0]
+            else:
+                hidden_states = kwargs.pop("hidden_states")
+            cudagraph_args = [hidden_states]
+
+            optional_inputs = kwargs.copy()
+            optional_inputs['is_first_microbatch'] = self.current_microbatch == 0
+            try:
+                import transformer_engine.pytorch as te  # pylint: disable=unused-import
+
+                def get_zero_attention_mask(slen_per_tpcp, micro_batch_size):
+                    sequence_parallel = self.config.sequence_parallel
+                    tensor_model_parallel_size = self.config.tensor_model_parallel_size
+                    slen_per_cp = (
+                        slen_per_tpcp * tensor_model_parallel_size
+                        if sequence_parallel
+                        else slen_per_tpcp
+                    )
+                    slen = slen_per_cp * self.config.context_parallel_size
+                    return torch.zeros(
+                        (micro_batch_size, 1, slen_per_cp, slen),
+                        dtype=torch.bool,
+                        device=torch.cuda.current_device(),
+                    )
+
+                if not is_te_min_version("1.10.0", check_equality=False):
+                    for k, v in kwargs.items():
+                        if k == "attention_mask":
+                            if v is not None:
+                                cudagraph_args.append(v)
+                                optional_inputs[k] = None
+                            else:
+                                cudagraph_args.append(
+                                    get_zero_attention_mask(
+                                        hidden_states.size(0), hidden_states.size(1)
+                                    )
+                                )
+                        else:
+                            assert v is None, "Keyword Arguments not supported with CUDA graph."
+                elif optional_inputs['attention_mask'] is None:
+                    # The attention_mask can be None when there is no padding to the input sequence.
+                    # However, an attention_mask Tensor must be passed into cudagraph for replay, so
+                    # we create an equivalent zero Tensor as the attention_mask.
+                    optional_inputs["attention_mask"] = get_zero_attention_mask(
+                        hidden_states.size(0), hidden_states.size(1)
+                    )
+            except ImportError:
+                raise RuntimeError("CUDAGraph requires TransformerEngine, but not installed")
+            return tuple(cudagraph_args), optional_inputs
+
+        cg_index = self.current_microbatch % len(self.cuda_graphs)
+        assert ('inference_context' not in kwargs or kwargs['inference_context'] is None) and (
+            'packed_seq_params' not in kwargs or kwargs['packed_seq_params'] is None
+        ), "CUDA graph accepts only Tensor inputs."
+        cudagraph_args, cudagraph_kwargs = _check_cuda_graph_replay_args(*args, **kwargs)
+
+        for hook, hook_args in self.cuda_graph_manual_hooks:
+            hook(*hook_args)
+        cuda_graph_output = self.cuda_graphs[cg_index](*cudagraph_args, **cudagraph_kwargs)
+
+        if cudagraph_kwargs['context'] is not None:
+            context = cuda_graph_output[-1]
+            cuda_graph_output = cuda_graph_output[:-1]
+        else:
+            context = None
+        if self.config.cuda_graph_scope == "attn":
+            # CUDA Graph only covers the attention layer. Feed-forward
+            # layer still goes through the normal pass.
+            output = self._forward_mlp(*cuda_graph_output)
+        else:
+            output = cuda_graph_output[0]
+        return output, context
+
+    def __call__(self, *args, **kwargs):
+        # Training and validation mode CUDA graphs
+        if hasattr(self, 'cudagraph_manager') and kwargs.get('inference_context') is None:
+            return self.cudagraph_manager(self, args, kwargs)
+        # Inference mode. CUDA graphs are used in the decode phase only, when attn mask is None
+        elif not self.training and (
+            hasattr(self, 'cudagraph_manager')
+            and kwargs['attention_mask'] is None
+            and (
+                (
+                    kwargs.get('inference_context') is not None
+                    and kwargs['inference_context'].is_decode_only()
+                )
+                or (
+                    kwargs.get('inference_params') is not None
+                    and kwargs['inference_params'].is_decode_only()
+                )
+            )
+        ):
+            assert (
+                kwargs.get('attention_mask') is None
+            ), f"Attention mask must not be set when using CUDA graphs for decode"
+            return self.cudagraph_manager(self, args, kwargs)
+        elif self.config.external_cuda_graph and self.training:
+            if not self.cuda_graphs:
+                # Do CUDA Graphs capture.
+                cuda_graph_func = self._cuda_graph_capture
+            else:
+                # Do CUDA Graphs replay.
+                cuda_graph_func = self._cuda_graph_replay
+            return cuda_graph_func(*args, **kwargs)
+        return super(MegatronModule, self).__call__(*args, **kwargs)
+
+
+
+
+class Transformer3dLayer(MegatronModule, BaseTransformerLayer):
+    """A single transformer layer.
+
+    Transformer layer takes input with size [s, b, h] and returns an
+    output of the same size.
+    """
+
+    def __init__(
+        self,
+        config: TransformerConfig,
+        submodules: TransformerLayerSubmodules,
+        layer_number: int = 1,
+        hidden_dropout: Optional[float] = None,
+        model_comm_pgs: Optional[ModelCommProcessGroups] = None,
+        vp_stage: Optional[int] = None,
+    ):
+        super().__init__(config=config)
+
+
+        # Enable cuda graphs.
+        if config.enable_cuda_graph or config.external_cuda_graph:
+            assert not (
+                config.enable_cuda_graph and config.external_cuda_graph
+            ), "Cudagraphs and external cudagraphs cannot be enabled at the same time"
+            if config.enable_cuda_graph:
+                if not self.training:
+                    # Cudagraphs for inference are only enabled with the flash decoding kernel
+                    assert (
+                        self.config.flash_decode
+                    ), "--flash-decode is required to use CUDA graphs during inference"
+                self.cudagraph_manager = CudaGraphManager(config)
+            else:
+                # List to store CUDA graphs. A list of `N` CUDA graphs for this layer where N is
+                # the number of microbatches. Multiple CUDA graphs per layer is required to support
+                # pipelining which requires running FWD graph of multiple microbatches before BWD
+                # graph. To enable CUDA graph, this list should be populated in the model training
+                # script with the graphs returned by make_graphed_callables API before the first
+                # training step.
+                self.cuda_graphs = []
+                # List to store forward pre-hooks. Forward pre-hooks are not captured into CUDA
+                # graphs. Those hooks and args are collected in this list and should be manually
+                # triggered before CUDA Graph running. This is required to ensure the correct param
+                # all-gather overlap with forward compute.
+                self.cuda_graph_manual_hooks = []
+                self.current_microbatch = -1
+
+        if model_comm_pgs is None:
+            model_comm_pgs = ModelCommProcessGroups.use_mpu_process_groups()
+
+        self.submodules_config = submodules
+        self.layer_number = layer_number + get_transformer_layer_offset(self.config, vp_stage)
+        self.hidden_dropout = config.hidden_dropout if hidden_dropout is None else hidden_dropout
+
+        # [Module 1: Input Layernorm] Optional Layernorm on the input data
+        # TODO: add pytorch only layernorm
+        self.input_layernorm = build_module(
+            submodules.input_layernorm,
+            config=self.config,
+            hidden_size=config.hidden_size,
+        )
+
+        attention_optional_kwargs = {}
+        if config.context_parallel_size > 1 and config.cp_comm_type is not None:
+            if isinstance(config.cp_comm_type, list):
+                attention_optional_kwargs["cp_comm_type"] = config.cp_comm_type[self.layer_number]
+            else:
+                attention_optional_kwargs["cp_comm_type"] = config.cp_comm_type
+
+        attention_optional_kwargs["model_comm_pgs"] = model_comm_pgs
+
+        # [Module 2: SelfAttention]
+        self.self_attention = build_module(
+            submodules.self_attention,
+            config=self.config,
+            layer_number=self.layer_number,
+            **attention_optional_kwargs,
+        )
+
+        # [Module 3: BiasDropoutFusion]
+        self.self_attn_bda = build_module(submodules.self_attn_bda)
+
+        # [Module 4: Post SelfAttention] Optional Layernorm after self-attn
+        self.pre_cross_attn_layernorm = build_module(
+            submodules.pre_cross_attn_layernorm,
+            config=self.config,
+            hidden_size=self.config.hidden_size,
+            eps=self.config.layernorm_epsilon,
+        )
+
+        # [Module 5: CrossAttention]
+        self.cross_attention = build_module(
+            submodules.cross_attention,
+            config=self.config,
+            layer_number=self.layer_number,
+            **attention_optional_kwargs,
+        )
+
+        # [Module 6: BiasDropoutFusion]
+        self.cross_attn_bda = build_module(submodules.cross_attn_bda, config=self.config)
+
+        # [Module 7: Pre MLP] Optional Layernorm before MLP
+        self.pre_mlp_layernorm = build_module(
+            submodules.pre_mlp_layernorm,
+            config=self.config,
+            hidden_size=config.hidden_size,
+        )
+        # [Module 8: MLP block]
+        additional_mlp_kwargs = {}
+        # import here to avoid circular import
+        from megatron.core.transformer.moe.experts import GroupedMLP, SequentialMLP, TEGroupedMLP
+        from megatron.core.transformer.moe.moe_layer import MoELayer
+
+        # MLP expects tp_group but MoELayer expects model_comm_pgs to be passed in.
+        # We can change MLP to accept model_comm_pgs but it makes the logic implicit
+        # The conditional below is to make the logic explicit
+        # if submodules.mlp is not a ModuleSpec,we dont have to handle passing additional kwargs
+        if isinstance(submodules.mlp, ModuleSpec):
+            if submodules.mlp.module in (MoELayer, GroupedMLP, TEGroupedMLP, SequentialMLP):
+                additional_mlp_kwargs["model_comm_pgs"] = model_comm_pgs
+            elif submodules.mlp.module == MLP:
+                assert hasattr(
+                    model_comm_pgs, 'tp'
+                ), 'TP process group is required for MLP in TransformerLayer'
+                additional_mlp_kwargs["tp_group"] = model_comm_pgs.tp
+            else:
+                log_single_rank(
+                    logger,
+                    logging.WARNING,
+                    f"Unknown MLP type: {type(submodules.mlp)}. Using default kwargs.",
+                )
+        self.mlp = build_module(submodules.mlp, config=self.config, **additional_mlp_kwargs)
+        if hasattr(self.mlp, 'set_layer_number'):
+            self.mlp.set_layer_number(self.layer_number)
+
+        # [Module 9: BiasDropoutFusion]
+        self.mlp_bda = build_module(submodules.mlp_bda)
+
+        self.recompute_input_layernorm = False
+        self.recompute_pre_mlp_layernorm = False
+        self.recompute_mlp = False
+        if self.config.recompute_granularity == 'selective':
+            if "layernorm" in self.config.recompute_modules:
+                if not isinstance(self.input_layernorm, IdentityOp):
+                    self.recompute_input_layernorm = True
+                if not isinstance(self.pre_mlp_layernorm, IdentityOp):
+                    self.recompute_pre_mlp_layernorm = True
+            if "mlp" in self.config.recompute_modules:
+
+                if not isinstance(self.mlp, MoELayer):
+                    self.recompute_mlp = True
+
+        # @jcasper how should we handle nvfuser?
+        # Set bias+dropout+add fusion grad_enable execution handler.
+        # TORCH_MAJOR = int(torch.__version__.split('.')[0])
+        # TORCH_MINOR = int(torch.__version__.split('.')[1])
+        # use_nvfuser = TORCH_MAJOR > 1 or (TORCH_MAJOR == 1 and TORCH_MINOR >= 10)
+        # self.bias_dropout_add_exec_handler = nullcontext if use_nvfuser else torch.enable_grad
+        self.bias_dropout_add_exec_handler = torch.enable_grad
+
+        self.modulation = torch.nn.Parameter(torch.randn(1, 6, config.hidden_size) / config.hidden_size**0.5)
+
+    @staticmethod
+    def _get_layer_offset(config: TransformerConfig):
+        """
+        Get the layer offset for the current pipeline stage.
+
+        Deprecated: please use `get_transformer_layer_offset` instead.
+        """
+
+        warnings.warn(
+            "TransformerLayer._get_layer_offset is deprecated."
+            "Please use get_transformer_layer_offset instead."
+        )
+        return get_transformer_layer_offset(config)
+
+    def forward(self, *args, **kwargs):
+        """
+        Perform a forward pass through the transformer layer.
+
+        This method calls the core computation of a transformer layer, including
+        self-attention, cross-attention (if applicable), and feed-forward operations.
+        """
+        pre_mlp_layernorm_output, residual, context, e = self._forward_attention(*args, **kwargs)
+        output = self._forward_mlp(
+            pre_mlp_layernorm_output, residual, kwargs.get("inference_context", None), e
+        )
+        return output, context
+
+    def _forward_attention(
+        self,
+        hidden_states: Tensor,
+        e: Tensor,
+        attention_mask: Optional[Tensor] = None,
+        context: Optional[Tensor] = None,
+        context_mask: Optional[Tensor] = None,
+        freqs: Optional[Tensor] = None,
+        grid_sizes: Optional[Tensor] = None,
+        packed_seq_params: Optional[PackedSeqParams] = None,
+    ):
+        """
+        Perform a forward pass through the attention layer and the layernorms before and after
+        the attention operations.
+
+        Args:
+            hidden_states (Tensor): Input tensor of shape [s, b, h] where s is sequence length,
+                b is batch size, and h is hidden size.
+            e (Tensor): Shape [B, 6, C]
+            attention_mask (Tensor): Mask tensor for self-attention.
+            context (Tensor, optional): Context tensor for cross-attention.
+            context_mask (Tensor, optional): Mask tensor for cross-attention.
+            rotary_pos_emb (Tensor, optional): Rotary positional embeddings.
+            attention_bias (Tensor, optional): Bias tensor for Q * K.T.
+            inference_context (object, optional): Parameters for inference-time optimizations.
+            packed_seq_params (object, optional): Parameters for packed sequence processing.
+            sequence_len_offset (Tensor, optional): Offset along sequence dimension
+                during inference.
+
+        Returns:
+            Tuple[Tensor, Tensor, Tensor]: A tuple containing:
+                pre_mlp_layernorm_output (Tensor): Transformed hidden states before the MLP.
+                residual (Tensor): Residual connection.
+                context (Tensor): Updated context tensor if cross-attention is used,
+                otherwise None.
+        """
+
+        # inference_context = deprecate_inference_params(inference_context, inference_params)
+
+        e = (self.modulation + e).chunk(6, dim=1)
+
+        # Residual connection.
+        residual = hidden_states
+
+        # Optional Input Layer norm
+        if self.recompute_input_layernorm:
+            self.input_layernorm_checkpoint = tensor_parallel.CheckpointWithoutOutput()
+            input_layernorm_output = self.input_layernorm_checkpoint.checkpoint(
+                self.input_layernorm, hidden_states
+            )
+        else:
+            input_layernorm_output = self.input_layernorm(hidden_states)
+        
+        input_layernorm_output = input_layernorm_output * (1 + e[1]) + e[0]
+
+        # Self attention.
+        nvtx_range_push(suffix="self_attention")
+        attention_output_with_bias = self.self_attention(
+            input_layernorm_output,
+            attention_mask=attention_mask,
+            freqs = freqs,
+            grid_sizes = grid_sizes,
+            packed_seq_params=packed_seq_params,
+        )
+        nvtx_range_pop(suffix="self_attention")
+
+        if self.recompute_input_layernorm:
+            # discard the output of the input layernorm and register the recompute
+            # as a gradient hook of attention_output_with_bias[0]
+            self.input_layernorm_checkpoint.discard_output_and_register_recompute(
+                attention_output_with_bias[0]
+            )
+
+        # TODO: could we move `bias_dropout_add_exec_handler` itself
+        # inside the module provided in the `bias_dropout_add_spec` module?
+        # 这里注释掉，手动时间残差连接
+        # nvtx_range_push(suffix="self_attn_bda")
+        # with self.bias_dropout_add_exec_handler():
+        #     hidden_states = self.self_attn_bda(self.training, self.config.bias_dropout_fusion)(
+        #         attention_output_with_bias, residual, self.hidden_dropout
+        #     )
+        # nvtx_range_pop(suffix="self_attn_bda")
+
+        hidden_states = hidden_states + residual * e[2]
+
+        # Residual connection.
+        residual = hidden_states
+
+        # Optional Layer norm after self-attention
+        pre_cross_attn_layernorm_output = self.pre_cross_attn_layernorm(hidden_states)
+
+        # Cross attention.
+        attention_output_with_bias = self.cross_attention(
+            pre_cross_attn_layernorm_output,
+            attention_mask=context_mask,
+            key_value_states=context,
+        )
+
+        hidden_states = attention_output_with_bias[0] + residual
+
+        # TODO: could we move `bias_dropout_add_exec_handler` itself
+        # inside the module provided in the `bias_dropout_add_spec` module?
+        # with self.bias_dropout_add_exec_handler():
+        #     hidden_states = self.cross_attn_bda(self.training, self.config.bias_dropout_fusion)(
+        #         attention_output_with_bias, residual, self.hidden_dropout
+        #     )
+
+        # Residual connection.
+        residual = hidden_states
+
+        # Optional Layer norm post the cross-attention.
+        if self.recompute_pre_mlp_layernorm:
+            self.pre_mlp_norm_checkpoint = tensor_parallel.CheckpointWithoutOutput()
+            pre_mlp_layernorm_output = self.pre_mlp_norm_checkpoint.checkpoint(
+                self.pre_mlp_layernorm, hidden_states
+            )
+        else:
+            pre_mlp_layernorm_output = self.pre_mlp_layernorm(hidden_states)
+        
+        pre_mlp_layernorm_output = pre_mlp_layernorm_output * (1 + e[4]) + e[3]
+
+        return pre_mlp_layernorm_output, residual, context, e
+
+    def _forward_mlp(self, pre_mlp_layernorm_output, residual, inference_context=None, e=None):
+        """
+        Perform a forward pass through the feed-forward layer.
+
+        Args:
+            pre_mlp_layernorm_output (Tensor): Transformed hidden states before the MLP.
+            residual (Tensor): Residual connection.
+
+        Returns:
+            output (Tensor): Transformed hidden states of shape [s, b, h].
+        """
+
+        nvtx_range_push(suffix="mlp")
+        # Potentially chunk the MLP computation during prefill to minimize the peak activation size
+        should_chunk_mlp_for_prefill = (
+            self.config.mlp_chunks_for_prefill > 1
+            and inference_context is not None
+            and not inference_context.is_decode_only()
+        )
+
+        if self.recompute_mlp:
+            if self.config.fp8:
+                # import here to avoid circular import
+                from megatron.core.extensions.transformer_engine import te_checkpoint
+
+                mlp_output_with_bias = te_checkpoint(
+                    self.mlp,
+                    False,
+                    tensor_parallel.random.get_cuda_rng_tracker,
+                    parallel_state.get_tensor_model_parallel_group(),
+                    pre_mlp_layernorm_output,
+                )
+            else:
+                mlp_output_with_bias = tensor_parallel.checkpoint(
+                    self.mlp, False, pre_mlp_layernorm_output
+                )
+        elif should_chunk_mlp_for_prefill:
+            # Chunk input along sequence dimension
+            num_chunks = min(self.config.mlp_chunks_for_prefill, pre_mlp_layernorm_output.shape[0])
+            chunks = pre_mlp_layernorm_output.chunk(num_chunks, dim=0)
+
+            # Compute outputs for each chunk
+            outputs = [self.mlp(chunk) for chunk in chunks]
+
+            # Aggregate chunk outputs
+            mlp_output = torch.cat([out for out, _ in outputs], dim=0)
+            bias_chunks = [bias for _, bias in outputs if bias is not None]
+            bias_output = torch.stack(bias_chunks, dim=0).sum(dim=0) if bias_chunks else None
+            mlp_output_with_bias = (mlp_output, bias_output)
+
+        else:
+            mlp_output_with_bias = self.mlp(pre_mlp_layernorm_output)
+
+
+        if self.recompute_pre_mlp_layernorm:
+            # discard the output of the pre-mlp layernorm and register the recompute
+            # as a gradient hook of mlp_output_with_bias[0]
+            self.pre_mlp_norm_checkpoint.discard_output_and_register_recompute(
+                mlp_output_with_bias[0]
+            )
+        nvtx_range_pop(suffix="mlp")
+
+        hidden_states = mlp_output_with_bias[0] + residual * e[5]
 
         # Jit compiled function creates 'view' tensor. This tensor
         # potentially gets saved in the MPU checkpoint function context,

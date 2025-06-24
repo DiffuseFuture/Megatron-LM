@@ -377,7 +377,6 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, c
     # NOTE: This code currently can handle at most one skip connection. It
     # needs to be modified slightly to support arbitrary numbers of skip
     # connections.
-
     if config.timers is not None:
         config.timers('backward-compute', log_level=2).start()
 
@@ -409,7 +408,6 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, c
             custom_backward(output_tensor[0], output_tensor_grad[0])
         else:
             torch.autograd.backward(output_tensor[0], grad_tensors=output_tensor_grad[0])
-
     # Collect the grad of the input_tensor.
     input_tensor_grad = [None]
     if input_tensor is not None:
@@ -435,7 +433,6 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, c
 
     if config.timers is not None:
         config.timers('backward-compute').stop()
-
     return input_tensor_grad
 
 
@@ -1630,6 +1627,7 @@ def get_tensor_shapes(
     rank: int,
     model_type: ModelType,
     seq_length: int,
+    context_seq_length: int,
     micro_batch_size: int,
     decoder_seq_length: int,
     config,
@@ -1644,29 +1642,29 @@ def get_tensor_shapes(
     If model has an encoder & decoder and rank is at the boundary, send one tensor.
     Otherwise, send one tensor.
     """
-    tensor_shapes = []
+    tensor_shapes = [([micro_batch_size, seq_length + context_seq_length, config.hidden_size])]
 
-    seq_length = seq_length // parallel_state.get_context_parallel_world_size()
-    if model_type == ModelType.encoder_and_decoder:
-        decoder_seq_length = decoder_seq_length // parallel_state.get_context_parallel_world_size()
+    # seq_length = seq_length // parallel_state.get_context_parallel_world_size()
+    # if model_type == ModelType.encoder_and_decoder:
+    #     decoder_seq_length = decoder_seq_length // parallel_state.get_context_parallel_world_size()
 
-    if config.sequence_parallel:
-        seq_length = seq_length // parallel_state.get_tensor_model_parallel_world_size()
-        if model_type == ModelType.encoder_and_decoder:
-            decoder_seq_length = (
-                decoder_seq_length // parallel_state.get_tensor_model_parallel_world_size()
-            )
+    # if config.sequence_parallel:
+    #     seq_length = seq_length // parallel_state.get_tensor_model_parallel_world_size()
+    #     if model_type == ModelType.encoder_and_decoder:
+    #         decoder_seq_length = (
+    #             decoder_seq_length // parallel_state.get_tensor_model_parallel_world_size()
+    #         )
 
-    if model_type == ModelType.encoder_and_decoder:
-        if parallel_state.is_inside_encoder(rank) and not parallel_state.is_inside_decoder(rank):
-            tensor_shapes.append((seq_length, micro_batch_size, config.hidden_size))
-        elif encoder_decoder_xattn:
-            tensor_shapes.append((decoder_seq_length, micro_batch_size, config.hidden_size))
-            tensor_shapes.append((seq_length, micro_batch_size, config.hidden_size))
-        else:
-            tensor_shapes.append((decoder_seq_length, micro_batch_size, config.hidden_size))
-    else:  # model_type == ModelType.encoder_or_decoder
-        tensor_shapes.append((seq_length, micro_batch_size, config.hidden_size))
+    # if model_type == ModelType.encoder_and_decoder:
+    #     if parallel_state.is_inside_encoder(rank) and not parallel_state.is_inside_decoder(rank):
+    #         tensor_shapes.append((seq_length, micro_batch_size, config.hidden_size))
+    #     elif encoder_decoder_xattn:
+    #         tensor_shapes.append((decoder_seq_length, micro_batch_size, config.hidden_size))
+    #         tensor_shapes.append((seq_length, micro_batch_size, config.hidden_size))
+    #     else:
+    #         tensor_shapes.append((decoder_seq_length, micro_batch_size, config.hidden_size))
+    # else:  # model_type == ModelType.encoder_or_decoder
+    #     tensor_shapes.append((seq_length, micro_batch_size, config.hidden_size))
     return tensor_shapes
 
 
@@ -1757,6 +1755,7 @@ def forward_backward_pipelining_without_interleaving(
     model: Union[torch.nn.Module, List[torch.nn.Module]],
     num_microbatches: int,
     seq_length: int,
+    context_seq_length: int,
     micro_batch_size: int,
     decoder_seq_length: Optional[int] = None,
     forward_only: bool = False,
@@ -1842,6 +1841,7 @@ def forward_backward_pipelining_without_interleaving(
         rank=rank - 1,
         model_type=model_type,
         seq_length=seq_length,
+        context_seq_length=context_seq_length,
         micro_batch_size=micro_batch_size,
         decoder_seq_length=decoder_seq_length,
         config=config,
@@ -1851,6 +1851,7 @@ def forward_backward_pipelining_without_interleaving(
         rank=rank,
         model_type=model_type,
         seq_length=seq_length,
+        context_seq_length=context_seq_length,
         micro_batch_size=micro_batch_size,
         decoder_seq_length=decoder_seq_length,
         config=config,
@@ -1907,6 +1908,7 @@ def forward_backward_pipelining_without_interleaving(
         if not forward_only:
             input_tensors.append(input_tensor)
             output_tensors.append(output_tensor)
+
             deallocate_output_tensor(output_tensor[0], config.deallocate_pipeline_outputs)
 
     # Before running 1F1B, need to receive first forward tensor.

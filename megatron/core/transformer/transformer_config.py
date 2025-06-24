@@ -1206,3 +1206,28 @@ class MLATransformerConfig(TransformerConfig):
         super().__post_init__()
         if self.multi_latent_attention and self.apply_rope_fusion and self.rope_type != "yarn":
             raise ValueError("apply_rope_fusion for MLA only works with YARN RoPE.")
+
+
+
+
+@dataclass
+class WanTransformerConfig(TransformerConfig):
+    model_type: str = 't2v'
+    patch_size: tuple[int, int, int] = (1, 2, 2)
+    text_len: int = 512
+    in_dim: int = 36  # 推断默认值
+    ffn_dim: int = 8960
+    freq_dim: int = 256
+    text_dim: int = 4096
+    out_dim: int = 16
+    window_size: tuple[int, int] = (-1, -1)
+    qk_norm: bool = True
+    cross_attn_norm: bool = True
+    in_channels: int = 16
+    add_control_adapter: bool = False
+    in_dim_control_adapter: int = 24
+    add_ref_conv: bool = False
+    in_dim_ref_conv: int = 16
+
+    def __post_init__(self):
+        super().__post_init__()

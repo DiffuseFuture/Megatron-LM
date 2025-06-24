@@ -6,6 +6,8 @@ from typing import List, Optional, Union
 
 import torch
 from torch import Tensor
+from megatron.core import parallel_state
+
 
 from megatron.core import parallel_state, tensor_parallel
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
@@ -220,7 +222,7 @@ def _get_block_submodules(
         elif issubclass(spec.module, BaseTransformerLayer):
             num_layers = get_num_layers_to_build(config, vp_stage)
             return TransformerBlockSubmodules(
-                layer_specs=[spec] * num_layers, layer_norm=LayerNormImpl
+                layer_specs=[spec] * num_layers, layer_norm=None
             )
         else:
             raise Exception(f"specialize for {spec.module.__name__}.")
@@ -327,8 +329,7 @@ class TransformerBlock(MegatronModule):
             self.final_layernorm = build_module(
                 self.submodules.layer_norm,
                 config=self.config,
-                hidden_size=self.config.hidden_size,
-                eps=self.config.layernorm_epsilon,
+                hidden_size=self.config.hidden_size
             )
         else:
             self.final_layernorm = None  # Either this or nn.Identity
@@ -653,3 +654,431 @@ class TransformerBlock(MegatronModule):
                 )
 
         return sharded_state_dict
+
+
+
+
+
+class Transformer3DBlock(MegatronModule):
+    """Transformer class."""
+
+    def __init__(
+        self,
+        config: TransformerConfig,
+        spec: Union[TransformerBlockSubmodules, ModuleSpec],
+        post_layer_norm: bool = True,
+        pre_process: bool = True,
+        post_process: bool = True,
+        model_comm_pgs: ModelCommProcessGroups = None,
+        vp_stage: Optional[int] = None,
+    ):
+        super().__init__(config=config)
+
+        self.submodules = _get_block_submodules(config, spec, vp_stage)
+        self.post_layer_norm = post_layer_norm
+        self.pre_process = pre_process
+        self.post_process = post_process
+        self.vp_stage = vp_stage
+
+        # required for pipeline parallel schedules
+        self.input_tensor = None
+
+        self.checkpoint_core_attention = (
+            self.config.recompute_granularity == 'selective'
+            and "core_attn" in self.config.recompute_modules
+        )
+
+        if get_cpu_offload_context is not None:
+            (self.offload_context, self.group_prefetch_offload_commit_async) = (
+                get_cpu_offload_context(
+                    self.config.cpu_offloading,
+                    self.config.cpu_offloading_num_layers,
+                    self.config.num_layers,
+                    self.config.cpu_offloading_activations,
+                    self.config.cpu_offloading_weights,
+                )
+            )
+            self.config._cpu_offloading_context = (
+                self.offload_context if self.config.cpu_offloading else None
+            )
+        else:
+            assert (
+                self.config.cpu_offloading is False
+            ), "CPU Offloading is enabled when TE is not present"
+
+            self.offload_context, self.group_prefetch_offload_commit_async = nullcontext(), None
+            self.config._cpu_offloading_context = None
+
+        if model_comm_pgs is None:
+            model_comm_pgs = ModelCommProcessGroups.use_mpu_process_groups()
+        self.model_comm_pgs = model_comm_pgs
+
+        self._build_layers()
+        self.num_layers_per_pipeline_rank = len(self.layers)
+
+    def _build_layers(self):
+        # Transformer layers.
+        # @jcasper can we improve how we deal with layer_number?
+        # currently it's only used in CoreAttention?
+        # if self.apply_query_key_layer_scaling:
+        #     coeff = self.layer_number
+        #     self.norm_factor *= coeff
+        def build_layer(layer_spec, layer_number):
+            global_layer_number = layer_number + get_transformer_layer_offset(
+                self.config, self.vp_stage
+            )  # 1-based index
+            if self.config.heterogeneous_block_specs:
+                layer_config = self.config.get_config_for_layer(global_layer_number)
+            else:
+                layer_config = self.config
+
+            fp8_init_context = get_fp8_context(layer_config, global_layer_number - 1, is_init=True)
+            with fp8_init_context:
+                module = build_module(
+                    layer_spec,
+                    config=layer_config,
+                    layer_number=layer_number,
+                    model_comm_pgs=self.model_comm_pgs,
+                    vp_stage=self.vp_stage,
+                )
+            return module
+
+        # offset is implicit in TransformerLayer
+        self.layers = torch.nn.ModuleList(
+            [
+                build_layer(layer_spec, i + 1)
+                for i, layer_spec in enumerate(self.submodules.layer_specs)
+            ]
+        )
+        
+        # @TODO: add back account_for_embedding_in_pipeline_split (see issue #293)
+        # In pipeline parallelism, we want to add this LN only to the last stage of the pipeline
+        # self.post_process and self.post_layer_norm guide this behavior
+        if self.submodules.layer_norm and self.post_process and self.post_layer_norm:
+            self.final_layernorm = build_module(
+                self.submodules.layer_norm,
+                config=self.config,
+                hidden_size=self.config.hidden_size
+            )
+        else:
+            self.final_layernorm = None  # Either this or nn.Identity
+
+    def _get_layer(self, layer_number: int):
+        return self.layers[layer_number]
+
+    def _checkpointed_forward(
+        self,
+        hidden_states: Tensor,
+        attention_mask: Tensor,
+        context: Tensor,
+        context_mask: Tensor,
+        rotary_pos_emb: Tensor,
+        attention_bias: Tensor,
+        packed_seq_params: PackedSeqParams,
+        use_inner_fp8_context: bool,
+    ):
+        """Forward method with activation checkpointing."""
+
+        def custom(start: int, end: int):
+            def custom_forward(
+                hidden_states, attention_mask, context, context_mask, rotary_pos_emb
+            ):
+                for index in range(start, end):
+                    layer = self._get_layer(index)
+                    inner_fp8_context = (
+                        get_fp8_context(self.config, layer.layer_number - 1)
+                        if use_inner_fp8_context
+                        else nullcontext()
+                    )
+                    with inner_fp8_context:
+                        hidden_states, context = layer(
+                            hidden_states=hidden_states,
+                            attention_mask=attention_mask,
+                            context=context,
+                            context_mask=context_mask,
+                            rotary_pos_emb=rotary_pos_emb,
+                            attention_bias=attention_bias,
+                            inference_context=None,
+                            packed_seq_params=packed_seq_params,
+                        )
+                return hidden_states, context
+
+            return custom_forward
+
+        def checkpoint_handler(forward_func):
+            """Determines whether to use the `te_checkpoint` or `tensor_parallel.checkpoint`"""
+            if self.config.fp8:
+                return te_checkpoint(
+                    forward_func,
+                    self.config.distribute_saved_activations,
+                    tensor_parallel.random.get_cuda_rng_tracker,
+                    parallel_state.get_tensor_model_parallel_group(),
+                    hidden_states,
+                    attention_mask,
+                    context,
+                    context_mask,
+                    rotary_pos_emb,
+                )
+            else:
+                return tensor_parallel.checkpoint(
+                    forward_func,
+                    self.config.distribute_saved_activations,
+                    hidden_states,
+                    attention_mask,
+                    context,
+                    context_mask,
+                    rotary_pos_emb,
+                )
+
+        if self.config.recompute_method == 'uniform':
+            # Uniformly divide the total number of Transformer layers and checkpoint
+            # the input activation of each divided chunk.
+            # A method to further reduce memory usage reducing checkpoints.
+            layer_idx = 0
+            while layer_idx < self.num_layers_per_pipeline_rank:
+                hidden_states, context = checkpoint_handler(
+                    custom(layer_idx, layer_idx + self.config.recompute_num_layers)
+                )
+
+                layer_idx += self.config.recompute_num_layers
+
+        elif self.config.recompute_method == 'block':
+            # Checkpoint the input activation of only a set number of individual
+            # Transformer layers and skip the rest.
+            # A method fully use the device memory removing redundant re-computation.
+            recompute_skip_num_layers = 0
+            for layer_idx in range(self.num_layers_per_pipeline_rank):
+                # Skip recomputation when input grad computation is not needed.
+                # Need to have at least one input tensor with gradient computation
+                # for re-enterant autograd engine.
+                if self.config.fp8 and not hidden_states.requires_grad:
+                    recompute_skip_num_layers += 1
+                if (
+                    layer_idx >= recompute_skip_num_layers
+                    and layer_idx < self.config.recompute_num_layers + recompute_skip_num_layers
+                ):
+                    hidden_states, context = checkpoint_handler(custom(layer_idx, layer_idx + 1))
+                else:
+                    hidden_states, context = custom(layer_idx, layer_idx + 1)(
+                        hidden_states, attention_mask, context, context_mask, rotary_pos_emb
+                    )
+        else:
+            raise ValueError("Invalid activation recompute method.")
+
+        return hidden_states
+
+    def set_input_tensor(self, input_tensor: Tensor):
+        """Set input tensor to be used instead of forward()'s input.
+
+        When doing pipeline parallelism the input from the previous
+        stage comes from communication, not from the input, so the
+        model's forward_step_func won't have it. This function is thus
+        used by internal code to bypass the input provided by the
+        forward_step_func"""
+        self.input_tensor = input_tensor
+
+
+
+    def forward(
+        self,
+        hidden_states: Tensor,
+        e: Tensor,
+        attention_mask: Tensor,
+        seq_len: int,
+        context_seqlen: int,
+        freqs: Tensor,
+        context: Tensor,
+        context_mask: Tensor,
+        grid_sizes: Tensor,
+        packed_seq_params: PackedSeqParams,
+    ):
+        """
+        Perform the forward pass through the transformer block.
+
+        This method handles the core computation of the transformer, including
+        self-attention, optional cross-attention, and feed-forward operations.
+
+        Args:
+            hidden_states (Union[Tensor, WrappedTensor]): Input tensor of shape [s, b, h]
+                where s is the sequence length, b is the batch size, and h is the hidden size.
+                Can be passed as a WrappedTensor during inference to avoid an obsolete
+                reference in the calling function.
+            attention_mask (Tensor): Boolean tensor of shape [1, 1, s, s] for masking
+                self-attention.
+            context (Tensor, optional): Context tensor for cross-attention.
+            context_mask (Tensor, optional): Mask for cross-attention context
+            rotary_pos_emb (Tensor, optional): Rotary positional embeddings.
+            attention_bias (Tensor): Bias tensor for Q * K.T of shape in shape broadcastable
+                to [b, num_head, sq, skv], e.g. [1, 1, sq, skv].
+                Used as an alternative to apply attention mask for TE cuDNN attention.
+            inference_context (BaseInferenceContext, optional): Parameters for inference-time
+                optimizations.
+            packed_seq_params (PackedSeqParams, optional): Parameters for packed sequence
+                processing.
+
+        Returns:
+            Union[Tensor, Tuple[Tensor, Tensor]]: The output hidden states tensor of shape
+            [s, b, h], and optionally the updated context tensor if cross-attention is used.
+        """
+
+
+        if isinstance(hidden_states, WrappedTensor):
+            hidden_states = hidden_states.unwrap()
+
+        if not parallel_state.is_pipeline_first_stage():
+            hidden_states = self.input_tensor
+            seqlen_sum = hidden_states.size(1)
+            assert(seq_len + context_seqlen == seqlen_sum)
+            context = hidden_states[:, seq_len:, :]
+            hidden_states = hidden_states[:, :seq_len, :]
+
+
+        # Viewless tensor.
+        # - We only need to create a viewless tensor in the case of micro batch
+        #   size (mbs) == 1, since in this case, 'hidden_states.transpose()'
+        #   above creates a view tensor, and '.contiguous()' is a pass-through.
+        #   For mbs >= 2, '.contiguous()' creates a new tensor, eliminating
+        #   the need to make it viewless.
+        #
+        #   However, we don't explicitly check mbs == 1 here because
+        #   make_viewless_tensor() has negligible overhead when its input
+        #   is already viewless.
+        #
+        # - For the 'else' case above, calling make_viewless_tensor() here is
+        #   likely redundant, since p2p_communication.py (likely originator)
+        #   already creates viewless tensors. That said, make_viewless_tensor()
+        #   is called here to be future-proof and corner-case-proof.
+        hidden_states = make_viewless_tensor(inp=hidden_states, requires_grad=True, keep_graph=True)
+
+        if self.config.sequence_parallel:
+            rng_context = tensor_parallel.get_cuda_rng_tracker().fork()
+        else:
+            rng_context = nullcontext()
+
+        # If fp8_recipe is delayed, wrap the entire pass with get_fp8_context(),
+        # otherwise do nothing extra at the outer level
+        # if we are using other fp8 recipes, then the context manager enter&exit are free
+        # we can wrap fp8_context within the for loop over layers, so that we can fine-grained
+        # control which layer will be fp8 or bf16
+        use_outer_fp8_context = self.config.fp8 and self.config.fp8_recipe == Fp8Recipe.delayed
+        use_inner_fp8_context = self.config.fp8 and self.config.fp8_recipe != Fp8Recipe.delayed
+        outer_fp8_context = get_fp8_context(self.config) if use_outer_fp8_context else nullcontext()
+
+        with rng_context, outer_fp8_context:
+            # Forward pass.
+            if self.config.recompute_granularity == 'full' and self.training:
+                raise NotImplementedError("Recompute granularity is not implemented for Transformer3DBlock")
+                hidden_states = self._checkpointed_forward(
+                    hidden_states=hidden_states,
+                    attention_mask=attention_mask,
+                    context=context,
+                    packed_seq_params=packed_seq_params,
+                    use_inner_fp8_context=use_inner_fp8_context,
+                )
+            else:
+                for l_no, layer in enumerate(self.layers):
+                    inner_fp8_context = (
+                        get_fp8_context(self.config, layer.layer_number - 1)
+                        if use_inner_fp8_context
+                        else nullcontext()
+                    )
+                
+                    with self.offload_context, inner_fp8_context:
+                        hidden_states, context = layer(
+                            hidden_states=hidden_states,
+                            e=e,
+                            attention_mask=attention_mask,
+                            context=context,
+                            context_mask=context_mask,
+                            freqs=freqs,
+                            grid_sizes=grid_sizes,
+                            packed_seq_params=packed_seq_params,
+                            # sequence_len_offset=sequence_len_offset,
+                        )
+
+                    if (
+                        torch.is_grad_enabled()
+                        and self.config.cpu_offloading
+                        and self.group_prefetch_offload_commit_async is not None
+                    ):
+                        hidden_states = self.group_prefetch_offload_commit_async(hidden_states)
+
+        # Final layer norm.
+        if self.final_layernorm is not None:
+            hidden_states = self.final_layernorm(hidden_states)
+            # TENorm produces a "viewed" tensor. This will result in schedule.py's
+            # deallocate_output_tensor() throwing an error, so a viewless tensor is
+            # created to prevent this.
+            hidden_states = make_viewless_tensor(
+                inp=hidden_states, requires_grad=True, keep_graph=True
+            )
+
+        return hidden_states
+
+    def sharded_state_dict(
+        self, prefix: str = '', sharded_offsets: tuple = (), metadata: dict = None
+    ) -> ShardedStateDict:
+        """
+        Generate a sharded state dictionary for the transformer block.
+
+        Args:
+            prefix (str, optional): Prefix to be added to all keys in the state dict.
+                Defaults to an empty string.
+            sharded_offsets (tuple, optional): Tuple of sharding offsets.
+            metadata (dict, optional): Additional metadata for sharding.
+                Can specify if layers are non-homogeneous. Defaults to None.
+
+        Returns:
+            ShardedStateDict: A dictionary containing the sharded state of the model.
+        """
+        assert not sharded_offsets, "Unexpected sharded offsets"
+        non_homogeneous_layers = metadata is not None and metadata.get(
+            'non_homogeneous_layers', False
+        )
+        if self.config.hetereogenous_dist_checkpoint:
+            non_homogeneous_layers = True
+
+        if isinstance(self.config.moe_layer_freq, int):
+            if self.config.moe_layer_freq > 1:
+                non_homogeneous_layers = True
+        elif isinstance(self.config.moe_layer_freq, list):
+            non_homogeneous_layers = True
+
+        if self.config.heterogeneous_block_specs:
+            non_homogeneous_layers = True
+
+        sharded_state_dict = {}
+
+        layer_prefix = f'{prefix}layers.'
+        num_layers = self.config.num_layers
+        for layer in self.layers:
+            offset = get_transformer_layer_offset(self.config, self.vp_stage)
+
+            global_layer_offset = layer.layer_number - 1  # self.layer_number starts at 1
+            state_dict_prefix = f'{layer_prefix}{global_layer_offset - offset}.'  # module list index in TransformerBlock # pylint: disable=line-too-long
+            if non_homogeneous_layers:
+                sharded_prefix = f'{layer_prefix}{global_layer_offset}.'
+                sharded_pp_offset = []
+            else:
+                sharded_prefix = layer_prefix
+                sharded_pp_offset = [
+                    (0, global_layer_offset, num_layers)
+                ]  # PP sharding offset for ShardedTensors
+            layer_sharded_state_dict = layer.sharded_state_dict(
+                state_dict_prefix, sharded_pp_offset, metadata
+            )
+            replace_prefix_for_sharding(layer_sharded_state_dict, state_dict_prefix, sharded_prefix)
+
+            sharded_state_dict.update(layer_sharded_state_dict)
+
+        # Add modules other than self.layers
+        for name, module in self.named_children():
+            if not module is self.layers:
+                sharded_state_dict.update(
+                    sharded_state_dict_default(
+                        module, f'{prefix}{name}.', sharded_offsets, metadata
+                    )
+                )
+
+        return sharded_state_dict
+
