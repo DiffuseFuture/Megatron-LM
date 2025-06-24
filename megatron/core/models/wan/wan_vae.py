@@ -11,7 +11,7 @@ from diffusers.models.modeling_outputs import AutoencoderKLOutput
 from diffusers.models.modeling_utils import ModelMixin
 from diffusers.utils.accelerate_utils import apply_forward_hook
 from einops import rearrange
-from megatron.core.transformer.module import MegatronModule
+from megatron.core.models.common.vision_module.vision_module import VisionModule
 
 
 CACHE_T = 2
@@ -698,7 +698,7 @@ class AutoencoderKLWan(ModelMixin, ConfigMixin, FromOriginalModelMixin):
         print(m, u)
         return model
 
-class WanVae(MegatronModule):
+class WanVae(VisionModule):
     def __init__(self, config, pretrained_model_path, additional_kwargs={}):
         super().__init__(config)
         if pretrained_model_path is not None:
