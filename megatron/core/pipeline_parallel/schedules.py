@@ -377,7 +377,6 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, c
     # NOTE: This code currently can handle at most one skip connection. It
     # needs to be modified slightly to support arbitrary numbers of skip
     # connections.
-    print("start bwd")
     if config.timers is not None:
         config.timers('backward-compute', log_level=2).start()
 
@@ -404,13 +403,11 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, c
     # will not participate in the computation.
     # This results in a tensor that does not require gradients.
     # In such cases, we intentionally skip the backward pass while preserving zero gradients.
-    print("start compute!")
     if output_tensor[0].requires_grad:
         if config.deallocate_pipeline_outputs:
             custom_backward(output_tensor[0], output_tensor_grad[0])
         else:
             torch.autograd.backward(output_tensor[0], grad_tensors=output_tensor_grad[0])
-    print("compute done!")
     # Collect the grad of the input_tensor.
     input_tensor_grad = [None]
     if input_tensor is not None:
@@ -436,7 +433,6 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, c
 
     if config.timers is not None:
         config.timers('backward-compute').stop()
-    print("bwd done !")
     return input_tensor_grad
 
 
@@ -1631,6 +1627,7 @@ def get_tensor_shapes(
     rank: int,
     model_type: ModelType,
     seq_length: int,
+    context_seq_length: int,
     micro_batch_size: int,
     decoder_seq_length: int,
     config,
@@ -1645,7 +1642,7 @@ def get_tensor_shapes(
     If model has an encoder & decoder and rank is at the boundary, send one tensor.
     Otherwise, send one tensor.
     """
-    tensor_shapes = [([1, 21060, 512])]
+    tensor_shapes = [([micro_batch_size, seq_length + context_seq_length, config.hidden_size])]
 
     # seq_length = seq_length // parallel_state.get_context_parallel_world_size()
     # if model_type == ModelType.encoder_and_decoder:
@@ -1758,6 +1755,7 @@ def forward_backward_pipelining_without_interleaving(
     model: Union[torch.nn.Module, List[torch.nn.Module]],
     num_microbatches: int,
     seq_length: int,
+    context_seq_length: int,
     micro_batch_size: int,
     decoder_seq_length: Optional[int] = None,
     forward_only: bool = False,
@@ -1843,6 +1841,7 @@ def forward_backward_pipelining_without_interleaving(
         rank=rank - 1,
         model_type=model_type,
         seq_length=seq_length,
+        context_seq_length=context_seq_length,
         micro_batch_size=micro_batch_size,
         decoder_seq_length=decoder_seq_length,
         config=config,
@@ -1852,6 +1851,7 @@ def forward_backward_pipelining_without_interleaving(
         rank=rank,
         model_type=model_type,
         seq_length=seq_length,
+        context_seq_length=context_seq_length,
         micro_batch_size=micro_batch_size,
         decoder_seq_length=decoder_seq_length,
         config=config,
@@ -1908,8 +1908,7 @@ def forward_backward_pipelining_without_interleaving(
         if not forward_only:
             input_tensors.append(input_tensor)
             output_tensors.append(output_tensor)
-            print("input_tensor", input_tensor)
-            print("output_tensor", output_tensor)
+
             deallocate_output_tensor(output_tensor[0], config.deallocate_pipeline_outputs)
 
     # Before running 1F1B, need to receive first forward tensor.
@@ -1981,7 +1980,6 @@ def forward_backward_pipelining_without_interleaving(
                 if config.grad_sync_func is None or rank == 0:
                     enable_grad_sync()
 
-            print("")
             input_tensor_grad = backward_step(
                 input_tensor, output_tensor, output_tensor_grad, model_type, config
             )
@@ -2039,7 +2037,6 @@ def forward_backward_pipelining_without_interleaving(
             if config.grad_sync_func is not None:
                 config.grad_sync_func(model.parameters())
 
-    print("start finalize_model_grads_func")
     if config.finalize_model_grads_func is not None and not forward_only:
 
         # If defer_embedding_wgrad_compute is enabled we need to do the
@@ -2052,7 +2049,6 @@ def forward_backward_pipelining_without_interleaving(
         config.finalize_model_grads_func(
             [model], total_num_tokens if config.calculate_per_token_loss else None
         )
-    print("end finalize_model_grads_func")
 
     if config.timers is not None:
         config.timers('forward-backward').stop()

@@ -3,6 +3,7 @@
 # Runs the "175B" parameter model
 
 export CUDA_DEVICE_MAX_CONNECTIONS=1
+export CUDA_LAUNCH_BLOCKING=1
 
 GPUS_PER_NODE=8
 # Change for multinode config
@@ -42,7 +43,7 @@ GPT_MODEL_ARGS=(
 
 TRAINING_ARGS=(
     --micro-batch-size 1 
-    --global-batch-size 8 
+    --global-batch-size 2
     --train-iters 1
     --weight-decay 0.1 
     --adam-beta1 0.9 

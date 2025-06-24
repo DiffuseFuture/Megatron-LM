@@ -90,8 +90,6 @@ def model_provider(
     if has_nvidia_modelopt and modelopt_args_enabled(args):  # [ModelOpt]
         return model_provider_modelopt(pre_process, post_process)
 
-    # use_te = args.transformer_impl == "transformer_engine"
-
     if args.record_memory_history:
         torch.cuda.memory._record_memory_history(
             True,
@@ -284,10 +282,10 @@ def forward_step(data_iterator, model: WanTransformer3DModel):
     with stimer:
         if(tokens is not None):
             device = tokens.device
-            print("type", tokens.dtype)
             x = torch.randn(1, 16, 6, 90, 156, device=device, dtype=torch.float16)
             t = torch.tensor([0], device=device)  # 假设 t 是时间步长标记之类的
             context = [torch.randn(209, 512, device=device, dtype=torch.float16)]
+            # context_mask =  torch.tril(torch.ones((1, 1, 21060, 209), device=context_ids.device, dtype=torch.bool))
             seqlen = 21060  # 这是个整数，不用放 device 上
             y = torch.randn(1, 20, 6, 90, 156, device=device, dtype=torch.float16)
             clip_fea = torch.randn(1, 257, 1280, device=device, dtype=torch.float16)
@@ -298,7 +296,6 @@ def forward_step(data_iterator, model: WanTransformer3DModel):
             seqlen = None
             clip_fea = None
             y = None
-        # print("start fwd")
         if parallel_state.is_pipeline_first_stage():
             context_ids = torch.ones((1, 209), dtype=torch.int64).cuda()
             causal_mask = torch.tril(torch.ones((1, 209, 209), device=context_ids.device, dtype=torch.bool))
@@ -306,7 +303,15 @@ def forward_step(data_iterator, model: WanTransformer3DModel):
             context = t5_model(context_ids, None, causal_mask, None, None)
             context = context.transpose(0, 1).contiguous()
             context = [c for c in context]
-        output_tensor = model(x, t, context, seqlen, attention_mask, clip_fea, y)
+        q_mask = torch.zeros((1, 1, 1, 21060), dtype=torch.bool).cuda()
+        kv_mask = torch.zeros((1, 1, 1, 512), dtype=torch.bool).cuda()
+        kv_mask_img = torch.zeros((1, 1, 1, 257), dtype=torch.bool).cuda()
+        context_mask = (q_mask, kv_mask, kv_mask_img)
+        hidden_state_seq_len = 21060
+        context_seqlen = 769
+
+        grid_sizes = torch.tensor([[ 6, 45, 78]], dtype=torch.int32).cuda()
+        output_tensor = model(x, t, context, context_mask, hidden_state_seq_len, context_seqlen, grid_sizes, None, clip_fea, y)
 
     # [ModelOpt]: model is needed to access ModelOpt distillation losses
     return output_tensor, partial(loss_func, loss_mask, model=model)

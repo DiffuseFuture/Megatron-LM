@@ -112,8 +112,6 @@ class WanRMSNorm(torch.nn.Module):
         Args:
             x(Tensor): Shape [B, L, C]
         """
-        print("x", x.shape)
-        print("weight", self.weight.shape)
         return self._norm(x.float()).type_as(x) * self.weight
 
     def _norm(self, x):

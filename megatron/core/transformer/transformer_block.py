@@ -6,6 +6,8 @@ from typing import List, Optional, Union
 
 import torch
 from torch import Tensor
+from megatron.core import parallel_state
+
 
 from megatron.core import parallel_state, tensor_parallel
 from megatron.core.dist_checkpointing.mapping import ShardedStateDict
@@ -752,7 +754,6 @@ class Transformer3DBlock(MegatronModule):
         # @TODO: add back account_for_embedding_in_pipeline_split (see issue #293)
         # In pipeline parallelism, we want to add this LN only to the last stage of the pipeline
         # self.post_process and self.post_layer_norm guide this behavior
-        #print("self.submodules.layer_norm", self.submodules.layer_norm)
         if self.submodules.layer_norm and self.post_process and self.post_layer_norm:
             self.final_layernorm = build_module(
                 self.submodules.layer_norm,
@@ -883,22 +884,13 @@ class Transformer3DBlock(MegatronModule):
         hidden_states: Tensor,
         e: Tensor,
         attention_mask: Tensor,
+        seq_len: int,
+        context_seqlen: int,
         freqs: Tensor,
         context: Tensor,
+        context_mask: Tensor,
+        grid_sizes: Tensor,
         packed_seq_params: PackedSeqParams,
-        # hidden_states: Union[Tensor, WrappedTensor],
-        # attention_mask: Optional[Tensor],
-        # context: Optional[Tensor] = None,
-        # context_mask: Optional[Tensor] = None,
-        # rotary_pos_emb: Optional[Tensor] = None,
-        # rotary_pos_cos: Optional[Tensor] = None,
-        # rotary_pos_sin: Optional[Tensor] = None,
-        # attention_bias: Optional[Tensor] = None,
-        # inference_context: Optional[BaseInferenceContext] = None,
-        # packed_seq_params: Optional[PackedSeqParams] = None,
-        # sequence_len_offset: Optional[Tensor] = None,
-        # *,
-        # inference_params: Optional[BaseInferenceContext] = None,
     ):
         """
         Perform the forward pass through the transformer block.
@@ -929,20 +921,17 @@ class Transformer3DBlock(MegatronModule):
             [s, b, h], and optionally the updated context tensor if cross-attention is used.
         """
 
-        # inference_context = deprecate_inference_params(inference_context, inference_params)
 
-        # Delete the obsolete reference to the initial input tensor if necessary
-
-        #print("hidden_states0 dtype", hidden_states.dtype, hidden_states.shape)
         if isinstance(hidden_states, WrappedTensor):
             hidden_states = hidden_states.unwrap()
 
-        #print("hidden_states1 dtype", hidden_states.dtype, hidden_states.shape)
-        if not self.pre_process:
-            # See set_input_tensor()
+        if not parallel_state.is_pipeline_first_stage():
             hidden_states = self.input_tensor
+            seqlen_sum = hidden_states.size(1)
+            assert(seq_len + context_seqlen == seqlen_sum)
+            context = hidden_states[:, seq_len:, :]
+            hidden_states = hidden_states[:, :seq_len, :]
 
-        #print("hidden_states2 dtype", hidden_states.dtype, hidden_states.shape)
 
         # Viewless tensor.
         # - We only need to create a viewless tensor in the case of micro batch
@@ -1000,7 +989,9 @@ class Transformer3DBlock(MegatronModule):
                             e=e,
                             attention_mask=attention_mask,
                             context=context,
+                            context_mask=context_mask,
                             freqs=freqs,
+                            grid_sizes=grid_sizes,
                             packed_seq_params=packed_seq_params,
                             # sequence_len_offset=sequence_len_offset,
                         )

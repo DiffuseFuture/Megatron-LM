@@ -496,10 +496,6 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
 
         # Self attention.
         nvtx_range_push(suffix="self_attention")
-        print("input_layernorm_output", input_layernorm_output.shape)
-        print("attention_mask", attention_mask.shape)
-        print("packed_seq_params", packed_seq_params)
-        print("sequence_len_offset", sequence_len_offset)
         attention_output_with_bias = self.self_attention(
             input_layernorm_output,
             attention_mask=attention_mask,
@@ -548,10 +544,10 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
 
         # TODO: could we move `bias_dropout_add_exec_handler` itself
         # inside the module provided in the `bias_dropout_add_spec` module?
-        with self.bias_dropout_add_exec_handler():
-            hidden_states = self.cross_attn_bda(self.training, self.config.bias_dropout_fusion)(
-                attention_output_with_bias, residual, self.hidden_dropout
-            )
+        # with self.bias_dropout_add_exec_handler():
+        #     hidden_states = self.cross_attn_bda(self.training, self.config.bias_dropout_fusion)(
+        #         attention_output_with_bias, residual, self.hidden_dropout
+        #     )
 
         # Residual connection.
         residual = hidden_states
@@ -899,7 +895,6 @@ class Transformer3dLayer(MegatronModule, BaseTransformerLayer):
     ):
         super().__init__(config=config)
 
-        print("layer number", layer_number)
 
         # Enable cuda graphs.
         if config.enable_cuda_graph or config.external_cuda_graph:
@@ -1076,7 +1071,9 @@ class Transformer3dLayer(MegatronModule, BaseTransformerLayer):
         e: Tensor,
         attention_mask: Optional[Tensor] = None,
         context: Optional[Tensor] = None,
+        context_mask: Optional[Tensor] = None,
         freqs: Optional[Tensor] = None,
+        grid_sizes: Optional[Tensor] = None,
         packed_seq_params: Optional[PackedSeqParams] = None,
     ):
         """
@@ -1119,13 +1116,9 @@ class Transformer3dLayer(MegatronModule, BaseTransformerLayer):
                 self.input_layernorm, hidden_states
             )
         else:
-            print("hidden_states before norm", hidden_states.dtype, hidden_states.shape)
             input_layernorm_output = self.input_layernorm(hidden_states)
-            print("hidden_states after norm", input_layernorm_output.dtype, hidden_states.shape)
         
-        print("hidden_states after norm0", input_layernorm_output.dtype, input_layernorm_output.shape)
         input_layernorm_output = input_layernorm_output * (1 + e[1]) + e[0]
-        print("hidden_states after norm1", input_layernorm_output.dtype, input_layernorm_output.shape)
 
         # Self attention.
         nvtx_range_push(suffix="self_attention")
@@ -1133,6 +1126,7 @@ class Transformer3dLayer(MegatronModule, BaseTransformerLayer):
             input_layernorm_output,
             attention_mask=attention_mask,
             freqs = freqs,
+            grid_sizes = grid_sizes,
             packed_seq_params=packed_seq_params,
         )
         nvtx_range_pop(suffix="self_attention")
@@ -1165,14 +1159,11 @@ class Transformer3dLayer(MegatronModule, BaseTransformerLayer):
         # Cross attention.
         attention_output_with_bias = self.cross_attention(
             pre_cross_attn_layernorm_output,
+            attention_mask=context_mask,
             key_value_states=context,
         )
 
         hidden_states = attention_output_with_bias[0] + residual
-
-
-        # if isinstance(attention_output_with_bias, dict) and "context" in attention_output_with_bias:
-            # context = attention_output_with_bias["context"]
 
         # TODO: could we move `bias_dropout_add_exec_handler` itself
         # inside the module provided in the `bias_dropout_add_spec` module?
@@ -1258,15 +1249,6 @@ class Transformer3dLayer(MegatronModule, BaseTransformerLayer):
                 mlp_output_with_bias[0]
             )
         nvtx_range_pop(suffix="mlp")
-
-        # TODO: could we move `bias_dropout_add_exec_handler` itself
-        # inside the module provided in the `bias_dropout_add_spec` module?
-        # nvtx_range_push(suffix="mlp_bda")
-        # with self.bias_dropout_add_exec_handler():
-        #     hidden_states = self.mlp_bda(self.training, self.config.bias_dropout_fusion)(
-        #         mlp_output_with_bias, residual, self.hidden_dropout
-        #     )
-        # nvtx_range_pop(suffix="mlp_bda")
 
         hidden_states = mlp_output_with_bias[0] + residual * e[5]
 

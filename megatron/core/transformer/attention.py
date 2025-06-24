@@ -94,6 +94,25 @@ class CrossAttentionSubmodules:
     linear_proj: Union[ModuleSpec, type] = None
 
 
+@dataclass
+class WanCrossAttentionSubmodules:
+    """
+    Configuration class for specifying the submodules of a cross-attention.
+    """
+
+    linear_q: Union[ModuleSpec, type] = None
+    linear_kv: Union[ModuleSpec, type] = None
+    core_attention: Union[ModuleSpec, type] = None
+    linear_proj: Union[ModuleSpec, type] = None
+    
+    q_layernorm: Union[ModuleSpec, type] = None
+    k_layernorm: Union[ModuleSpec, type] = None
+
+    linear_kv_img: Union[ModuleSpec, type] = None
+
+    k_img_layernorm: Union[ModuleSpec, type] = None
+
+
 class Attention(MegatronModule, ABC):
     """Attention layer abstract class.
 
@@ -1193,9 +1212,7 @@ class WanSelfAttention(Attention):
         Derives `query`, `key` and `value` tensors from `hidden_states`.
         """
         # Attention heads [sq, b, h] --> [sq, b, ng * (np/ng + 2) * hn)]
-        print("hidden_states", hidden_states.dtype, hidden_states.shape)
         mixed_qkv, _ = self.linear_qkv(hidden_states)
-        print("mixed_qkv", mixed_qkv.shape)
 
         # [sq, b, hp] --> [sq, b, ng, (np/ng + 2) * hn]
         new_tensor_shape = mixed_qkv.size()[:-1] + (
@@ -1205,7 +1222,6 @@ class WanSelfAttention(Attention):
                 * self.hidden_size_per_attention_head
             ),
         )
-        print("new_tensor_shape", new_tensor_shape)
         mixed_qkv = mixed_qkv.view(*new_tensor_shape)
 
         split_arg_list = [
@@ -1250,6 +1266,7 @@ class WanSelfAttention(Attention):
         hidden_states: Tensor,
         attention_mask: Tensor,
         freqs: Tensor,
+        grid_sizes: Tensor,
         packed_seq_params: Optional[PackedSeqParams] = None,
     ) -> Tuple[Tensor, Tensor]:
         """
@@ -1275,16 +1292,12 @@ class WanSelfAttention(Attention):
 
         """
 
-
-
-
         # =====================
         # Query, Key, and Value
         # =====================
         # Get the query, key and value tensors based on the type of attention -
         # self or cross attn.
         nvtx_range_push(suffix="qkv")
-        print("hidden_states shape", hidden_states.shape)
         query, key, value = self.get_query_key_value_tensors(hidden_states, None)
         nvtx_range_pop(suffix="qkv")
 
@@ -1292,8 +1305,8 @@ class WanSelfAttention(Attention):
         # Adjust key, value, and rotary_pos_emb for inference
         # ===================================================
 
-        query = rope_apply(query, freqs)
-        key = rope_apply(key, freqs)
+        query = rope_apply(query, grid_sizes, freqs)
+        key = rope_apply(key, grid_sizes, freqs)
 
 
         # ==================================
@@ -1339,3 +1352,217 @@ class WanSelfAttention(Attention):
         nvtx_range_pop(suffix="linear_proj")
 
         return output, bias
+
+
+
+class WanCrossAttention(Attention):
+    """Cross-attention layer class
+
+    Cross-attention layer takes input with size [s, b, h] and context with size
+    [s, b, h] and returns output of the same size.
+    """
+
+    def __init__(
+        self,
+        config: TransformerConfig,
+        submodules: CrossAttentionSubmodules,
+        layer_number: int,
+        attn_mask_type=AttnMaskType.padding,
+        cp_comm_type: str = None,
+        model_comm_pgs: ModelCommProcessGroups = None,
+    ):
+        super().__init__(
+            config=config,
+            submodules=submodules,
+            layer_number=layer_number,
+            attn_mask_type=attn_mask_type,
+            attention_type="cross",
+            cp_comm_type=cp_comm_type,
+            model_comm_pgs=model_comm_pgs,
+        )
+
+        if self.config.num_query_groups != self.config.num_attention_heads:
+            raise ValueError("Group query attention is not currently supported in cross attention.")
+        assert self.query_projection_size == self.kv_projection_size
+
+        self.linear_q = build_module(
+            submodules.linear_q,
+            self.config.hidden_size,
+            self.query_projection_size,
+            config=self.config,
+            init_method=self.config.init_method,
+            gather_output=False,
+            bias=self.config.add_bias_linear,
+            skip_bias_add=False,
+            is_expert=False,
+        )
+        
+        self.q_layernorm = build_module(
+            submodules.q_layernorm,
+            config=self.config,
+            hidden_size=self.hidden_size_per_attention_head,
+        )
+
+        self.k_layernorm = build_module(
+            submodules.k_layernorm,
+            config=self.config,
+            hidden_size=self.hidden_size_per_attention_head,
+        )
+
+        
+
+        self.linear_kv = build_module(
+            submodules.linear_kv,
+            self.config.hidden_size,
+            2 * self.kv_projection_size,
+            config=self.config,
+            init_method=self.config.init_method,
+            gather_output=False,
+            bias=self.config.add_bias_linear,
+            skip_bias_add=False,
+            is_expert=False,
+        )
+        
+        self.k_layernorm_img = build_module(
+            submodules.k_img_layernorm,
+            config=self.config,
+            hidden_size=self.hidden_size_per_attention_head,
+        )
+
+        self.linear_kv_img = build_module(
+            submodules.linear_kv_img,
+            self.config.hidden_size,
+            2 * self.kv_projection_size,
+            config=self.config,
+            init_method=self.config.init_method,
+            gather_output=False,
+            bias=self.config.add_bias_linear,
+            skip_bias_add=False,
+            is_expert=False,
+        )
+
+    def get_query_key_value_tensors(self, hidden_states, context, context_img):
+        """
+        Derives `query` tensor from `hidden_states`, and `key`/`value` tensors
+        from `key_value_states`.
+        """
+        # Attention heads [sk, b, h] --> [sk, b, (np * 2 * hn)]
+        mixed_kv, _ = self.linear_kv(context)
+
+        # [sk, b, (np * 2 * hn)] --> [sk, b, np, 2 * hn]
+        new_tensor_shape = mixed_kv.size()[:-1] + (
+            self.num_attention_heads_per_partition,
+            2 * self.hidden_size_per_attention_head,
+        )
+        mixed_kv = mixed_kv.view(*new_tensor_shape)
+
+        # [sk, b, np, 2 * hn] --> 2 [sk, b, np, hn]
+        (key, value) = tensor_parallel.split_tensor_along_last_dim(mixed_kv, 2)
+
+        # Attention head [sq, b, h] --> [sq, b, hp]
+        query, _ = self.linear_q(hidden_states)
+
+        # [sq, b, hp] --> [sq, b, np, hn]
+        new_tensor_shape = query.size()[:-1] + (
+            self.num_attention_heads_per_partition,
+            self.hidden_size_per_attention_head,
+        )
+        query = query.view(*new_tensor_shape)
+
+
+        mixed_kv, _ = self.linear_kv_img(context_img)
+        new_tensor_shape = mixed_kv.size()[:-1] + (
+            self.num_attention_heads_per_partition,
+            2 * self.hidden_size_per_attention_head,
+        )
+        mixed_kv = mixed_kv.view(*new_tensor_shape)
+        (key_img, value_img) = tensor_parallel.split_tensor_along_last_dim(mixed_kv, 2)
+
+        query = self.q_layernorm(query)
+        ley = self.k_layernorm(query)
+        key_img = self.k_layernorm_img(key_img)
+
+        return query, key, value, key_img, value_img
+
+    def forward(
+        self,
+        hidden_states: Tensor,
+        attention_mask: Tensor,
+        key_value_states: Optional[Tensor] = None,
+        packed_seq_params: Optional[PackedSeqParams] = None,
+    ) -> Tuple[Tensor, Tensor]:
+
+
+        context_img = key_value_states[:, :257]
+        context = key_value_states[:, 257:]
+
+        # =====================
+        # Query, Key, and Value
+        # =====================
+        # Get the query, key and value tensors based on the type of attention -
+        # self or cross attn.
+        nvtx_range_push(suffix="qkv")
+        query, key, value, key_img, value_img = self.get_query_key_value_tensors(hidden_states, context, context_img)
+        nvtx_range_pop(suffix="qkv")
+
+        
+        # ==================================
+        # core attention computation
+        # ==================================
+
+        nvtx_range_push(suffix="core_attention")
+        if self.checkpoint_core_attention and self.training:
+            core_attn_out = self._checkpointed_attention_forward(
+                query,
+                key,
+                value,
+                attention_mask,
+                attn_mask_type=self.attn_mask_type,
+                packed_seq_params=packed_seq_params,
+            )
+        else:
+            # Static batching attention kernel.
+
+            attention_mask_img = (attention_mask[0], attention_mask[2])
+            core_attn_out_img = self.core_attention(
+                query,
+                key_img,
+                value_img,
+                attention_mask_img,
+                attn_mask_type=self.attn_mask_type,
+                packed_seq_params=packed_seq_params,
+            )
+
+            attention_mask_x = (attention_mask[0], attention_mask[1])
+            core_attn_out = self.core_attention(
+                query,
+                key,
+                value,
+                attention_mask_x,
+                attn_mask_type=self.attn_mask_type,
+                packed_seq_params=packed_seq_params,
+            )
+
+
+        if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
+            # reshape to same output shape as unpacked case
+            # (t, np, hn) -> (t, b=1, h=np*hn)
+            # t is the pack size = sum (sq_i)
+            # note that batch is a dummy dimension in the packed case
+            core_attn_out_img = core_attn_out_img.reshape(core_attn_out_img.size(0), 1, -1)
+            core_attn_out = core_attn_out.reshape(core_attn_out.size(0), 1, -1)
+            
+        nvtx_range_pop(suffix="core_attention")
+
+        # =================
+        # Output. [sq, b, h]
+        # =================
+
+        hidden_state = core_attn_out_img[0] + core_attn_out[0]
+
+        nvtx_range_push(suffix="linear_proj")
+        output, bias = self.linear_proj(hidden_state)
+        nvtx_range_pop(suffix="linear_proj")
+
+        return output, bias
+
