@@ -8,7 +8,7 @@ export CUDA_LAUNCH_BLOCKING=1
 GPUS_PER_NODE=8
 # Change for multinode config
 MASTER_ADDR=localhost
-MASTER_PORT=6000
+MASTER_PORT=6001
 NUM_NODES=1
 NODE_RANK=0
 WORLD_SIZE=$(($GPUS_PER_NODE*$NUM_NODES))
@@ -37,7 +37,7 @@ GPT_MODEL_ARGS=(
    --hidden-size 512 
    --num-attention-heads 8 
    --seq-length 1024 
-   # --tensor-model-parallel-size 1 
+   # --tensor-model-parallel-size 4
    # --pipeline-model-parallel-size 1 
 )
 
@@ -89,7 +89,7 @@ EVAL_AND_LOGGING_ARGS=(
     --tensorboard-dir $TENSORBOARD_LOGS_PATH
 )
 
-torchrun ${DISTRIBUTED_ARGS[@]} /jizhicfs/marvinhjia/njw1123/add_dit/pretrain_gpt.py \
+torchrun ${DISTRIBUTED_ARGS[@]} /jizhicfs/marvinhjia/MLSys/wan/megatron/Megatron-LM/pretrain_wan.py \
     ${GPT_MODEL_ARGS[@]} \
     ${TRAINING_ARGS[@]} \
     ${MODEL_PARALLEL_ARGS[@]} \

@@ -24,7 +24,6 @@ from diffusers.models.modeling_utils import ModelMixin
 
 from megatron.core.extensions.transformer_engine import (
     TEDotProductAttention,
-    TELayerNormColumnParallelLinear,
     TEColumnParallelLinear,
     TERowParallelLinear,
 )
@@ -378,6 +377,37 @@ class WanCLIPVisionTransformer(VisionModule):
             for layer in self.transformer:
                 x = layer(x, attention_mask)
             return x
+
+
+# class XLMRobertaWithHead(XLMRoberta):
+#     def __init__(self, 
+#                  config: TransformerConfig,
+#                  wan_clip_xlm_spec: ModuleSpec, 
+#                  **kwargs):
+#         self.out_dim = kwargs.pop('out_dim')
+#         super().__init__(config)
+        
+#         mid_dim = (self.dim + self.out_dim) // 2
+#         """
+#         self.head = nn.Sequential(
+#             nn.Linear(self.dim, mid_dim, bias=False), nn.GELU(),
+#             nn.Linear(mid_dim, self.out_dim, bias=False))
+#         """
+#         self.head = nn.Sequential(
+#                                 ColumnParallelLinear(self.dim, mid_dim, gather_output=True, bias=False),
+#                                 nn.GELU(),
+#                                 RowParallelLinear(mid_dim, self.out_dim, input_is_parallel=True, bias=False)
+#                                 )
+        
+#     def forward(self, ids):
+#         x = super().forward(ids)
+
+#         # average pooling
+#         mask = ids.ne(self.pad_id).unsqueeze(-1).to(x)
+#         x = (x * mask).sum(dim=1) / mask.sum(dim=1)
+
+#         x = self.head(x)        
+#         return x
 
 
 class XLMRobertaCLIP(VisionModule):

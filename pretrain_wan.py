@@ -29,7 +29,7 @@ from megatron.core.models.T5.t5_spec import (
 
 from megatron.core.models.VideoX_Fun import WanTransformer3DModel
 from megatron.core.models.T5 import T5Model
-from megatron.core.models.wan.wan_vae import WanVae
+from megatron.core.models.wan.wan_vae import WanVae, AutoencoderKLWan
 from megatron.core.models.wan.wan_image_encoder import WanCLIP, get_wan_clip_spec, get_wan_clip_spec_te
 
 # from megatron.core.models.gpt.heterogeneous.heterogeneous_layer_specs import (
@@ -150,22 +150,25 @@ def model_provider(
         )
         t5_model.cuda(torch.cuda.current_device())
         t5_model = Float16Module(t5_config, t5_model)
-        
+        t5_model.requires_grad_(False)
         # init vae
         vae_config = copy.deepcopy(config)
         
         global vae_model
-        vae_model = WanVae(vae_config)
-        
+        pretrained_model_path = "/jizhicfs/marvinhjia/MLSys/wan/Wan2.1-Fun-V1.1-1.3B-InP/Wan2.1_VAE.pth" 
+        vae_model = WanVae(config, pretrained_model_path).to(torch.float16).cuda(torch.cuda.current_device())
+        vae_model.requires_grad_(False)
         # init clip
         clip_config = copy.deepcopy(config)
-        if args.transformer_impl == "transformer_engine"
-            clip_spec = get_wan_clip_spec_te(clip_config)
+        clip_config.hidden_size = 1280
+        clip_config.num_attention_heads = 8
+        if args.transformer_impl == "transformer_engine":
+            clip_spec = get_wan_clip_spec_te()
         else:
-            clip_spec = get_wan_clip_spec(clip_config)
+            clip_spec = get_wan_clip_spec()
         global clip_model
-        clip_model = WanCLIP(clip_config, clip_spec)
-        
+        clip_model = WanCLIP(clip_config, clip_spec).to(torch.float16).cuda(torch.cuda.current_device())
+        clip_model.requires_grad_(False)
         
     transformer_layer_spec = get_transformer3d_layer_local_spec()
 
@@ -298,21 +301,21 @@ def forward_step(data_iterator, model: WanTransformer3DModel):
     with stimer:
         if(tokens is not None):
             device = tokens.device
-            x = torch.randn(1, 16, 6, 90, 156, device=device, dtype=torch.float16)
+            vae_fea = torch.randn(1, 16, 6, 90, 156, device=device, dtype=torch.float16)
             t = torch.tensor([0], device=device)  # 假设 t 是时间步长标记之类的
             context = [torch.randn(209, 512, device=device, dtype=torch.float16)]
             # context_mask =  torch.tril(torch.ones((1, 1, 21060, 209), device=context_ids.device, dtype=torch.bool))
             seqlen = 21060  # 这是个整数，不用放 device 上
-            y = torch.randn(1, 20, 6, 90, 156, device=device, dtype=torch.float16)
+            inpaint_latents = torch.randn(1, 20, 6, 90, 156, device=device, dtype=torch.float16)
             clip_context = torch.randn(1, 257, 1280, device=device, dtype=torch.float16)
         else:
-            x = None
+            vae_fea = None
             t = torch.tensor([0]).cuda()  # 假设 t 是时间步长标记之类的
             context = None
             seqlen = None
             clip_context = None
             vae_fea = None
-            y = None
+            inpaint_latents = None
         if parallel_state.is_pipeline_first_stage():
             context_ids = torch.ones((1, 209), dtype=torch.int64).cuda()
             causal_mask = torch.tril(torch.ones((1, 209, 209), device=context_ids.device, dtype=torch.bool))
@@ -321,19 +324,25 @@ def forward_step(data_iterator, model: WanTransformer3DModel):
             context = context.transpose(0, 1).contiguous()
             context = [c for c in context]
             
-            device = tokens.device
+            device = torch.device("cuda")
+            vae_model.eval()
+            vae_input = torch.randn((1, 3, 21, 720, 1248), device=device, dtype=torch.float16)
+            vae_fea = vae_model.encode(vae_input)   
+            vae_fea = vae_fea[0].sample()
+            mask = torch.ones((1, 4, 6, 90, 156), device=device, dtype=torch.float16)
+            mask_pixel_values = torch.randn((1, 3, 21, 720, 1248), device=device, dtype=torch.float16)
+            mask_latents = vae_model.encode(mask_pixel_values)[0].sample()
+            inpaint_latents = torch.concat([mask_latents, mask], dim = 1)
+            
+            
+            clip_model.eval()
             clip_context = []
             clip_input = [torch.randn((3, 1, 720, 1248), device = device, dtype = torch.float16),]
-            clip_mask = torch.zeros(257, 2, 1, 1).to(torch.bool).to(device)
+            clip_mask = torch.zeros(257,257).to(torch.bool).to(device)
             clip_fea = clip_model(clip_input, clip_mask)
             clip_context.append(clip_fea)
             clip_context = torch.cat(clip_context)
-            
-            vae_input = torch.randn((1, 3, 21, 720, 1248), device=device, dtype=torch.float16)
-            mask = torch.ones((1, 4, 6, 90, 156), dtype=torch.float16)
-            vae_fea = vae_model.encode(vae_input)
-            vae_fea = torch.concat([vae_fea, mask], dim = 0)
-            
+
             
         q_mask = torch.zeros((1, 1, 1, 21060), dtype=torch.bool).cuda()
         kv_mask = torch.zeros((1, 1, 1, 512), dtype=torch.bool).cuda()
@@ -343,7 +352,7 @@ def forward_step(data_iterator, model: WanTransformer3DModel):
         context_seqlen = 769
 
         grid_sizes = torch.tensor([[ 6, 45, 78]], dtype=torch.int32).cuda()
-        output_tensor = model(x, t, context, context_mask, hidden_state_seq_len, context_seqlen, grid_sizes, None, clip_context, vae_fea)
+        output_tensor = model(vae_fea, t, context, context_mask, hidden_state_seq_len, context_seqlen, grid_sizes, None, clip_context, y = inpaint_latents)
 
     # [ModelOpt]: model is needed to access ModelOpt distillation losses
     return output_tensor, partial(loss_func, loss_mask, model=model)
