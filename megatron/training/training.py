@@ -2665,16 +2665,16 @@ def build_train_valid_test_data_loaders(build_train_valid_test_datasets_provider
     if is_distributed or mpu.get_tensor_model_parallel_rank() == 0:
 
         # Build datasets.
-        train_ds, valid_ds, test_ds = build_train_valid_test_datasets(
+        train_dataloader, valid_dataloader, test_dataloader = build_train_valid_test_datasets(
             build_train_valid_test_datasets_provider
         )
-        # Build dataloders.
-        train_dataloader = build_pretraining_data_loader(train_ds, args.consumed_train_samples)
-        if args.skip_train:
-            valid_dataloader = build_pretraining_data_loader(valid_ds, 0)
-        else:
-            valid_dataloader = build_pretraining_data_loader(valid_ds, args.consumed_valid_samples)
-        test_dataloader = build_pretraining_data_loader(test_ds, 0)
+        # # Build dataloders.
+        # train_dataloader = build_pretraining_data_loader(train_ds, args.consumed_train_samples)
+        # if args.skip_train:
+        #     valid_dataloader = build_pretraining_data_loader(valid_ds, 0)
+        # else:
+        #     valid_dataloader = build_pretraining_data_loader(valid_ds, args.consumed_valid_samples)
+        # test_dataloader = build_pretraining_data_loader(test_ds, 0)
 
         # Flags to know if we need to do training/validation/testing.
         do_train = train_dataloader is not None and args.train_iters > 0

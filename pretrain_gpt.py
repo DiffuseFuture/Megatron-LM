@@ -18,7 +18,7 @@ from megatron.training import get_tokenizer
 from megatron.core import mpu
 from megatron.core.enums import ModelType
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
-from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, MockGPTDataset
+# from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, MockGPTDataset
 from megatron.core.enums import ModelType
 from megatron.core.transformer.module import Float16Module
 
@@ -324,31 +324,31 @@ def is_dataset_built_on_rank():
     ) and parallel_state.get_tensor_model_parallel_rank() == 0
 
 
-def core_gpt_dataset_config_from_args(args):
-    tokenizer = get_tokenizer()
+# def core_gpt_dataset_config_from_args(args):
+#     tokenizer = get_tokenizer()
 
-    # Sometimes --data-path is too long, instead we parse it from a file.
-    blend: Optional[Tuple[List[str], Optional[List[float]]]]
-    blend_per_split: Optional[List[Optional[Tuple[List[str], Optional[List[float]]]]]]
-    blend, blend_per_split = get_blend_and_blend_per_split(args)
+#     # Sometimes --data-path is too long, instead we parse it from a file.
+#     blend: Optional[Tuple[List[str], Optional[List[float]]]]
+#     blend_per_split: Optional[List[Optional[Tuple[List[str], Optional[List[float]]]]]]
+#     blend, blend_per_split = get_blend_and_blend_per_split(args)
 
-    return GPTDatasetConfig(
-        random_seed=args.seed,
-        sequence_length=args.seq_length,
-        blend=blend,
-        blend_per_split=blend_per_split,
-        split=args.split,
-        num_dataset_builder_threads=args.num_dataset_builder_threads,
-        path_to_cache=args.data_cache_path,
-        mmap_bin_files=args.mmap_bin_files,
-        tokenizer=tokenizer,
-        reset_position_ids=args.reset_position_ids,
-        reset_attention_mask=args.reset_attention_mask,
-        eod_mask_loss=args.eod_mask_loss,
-        create_attention_mask=args.create_attention_mask_in_dataloader,
-        object_storage_cache_path=args.object_storage_cache_path,
-        mid_level_dataset_surplus=args.mid_level_dataset_surplus,
-    )
+#     return GPTDatasetConfig(
+#         random_seed=args.seed,
+#         sequence_length=args.seq_length,
+#         blend=blend,
+#         blend_per_split=blend_per_split,
+#         split=args.split,
+#         num_dataset_builder_threads=args.num_dataset_builder_threads,
+#         path_to_cache=args.data_cache_path,
+#         mmap_bin_files=args.mmap_bin_files,
+#         tokenizer=tokenizer,
+#         reset_position_ids=args.reset_position_ids,
+#         reset_attention_mask=args.reset_attention_mask,
+#         eod_mask_loss=args.eod_mask_loss,
+#         create_attention_mask=args.create_attention_mask_in_dataloader,
+#         object_storage_cache_path=args.object_storage_cache_path,
+#         mid_level_dataset_surplus=args.mid_level_dataset_surplus,
+#     )
 
 
 def train_valid_test_datasets_provider(train_val_test_num_samples):
@@ -359,22 +359,57 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
     """
     args = get_args()
 
-    config = core_gpt_dataset_config_from_args(args)
+    # config = core_gpt_dataset_config_from_args(args)
 
-    if args.mock_data:
-        dataset_type = MockGPTDataset
-    else:
-        dataset_type = GPTDataset
+    # if args.mock_data:
+    #     dataset_type = MockGPTDataset
+    # else:
+    #     dataset_type = GPTDataset
 
-    print_rank_0("> building train, validation, and test datasets for GPT ...")
+    # print_rank_0("> building train, validation, and test datasets for GPT ...")
 
-    train_ds, valid_ds, test_ds = BlendedMegatronDatasetBuilder(
-        dataset_type, train_val_test_num_samples, is_dataset_built_on_rank, config
-    ).build()
+    # train_ds, valid_ds, test_ds = BlendedMegatronDatasetBuilder(
+    #     dataset_type, train_val_test_num_samples, is_dataset_built_on_rank, config
+    # ).build()
 
-    print_rank_0("> finished creating GPT datasets ...")
+    # print_rank_0("> finished creating GPT datasets ...")
 
-    return train_ds, valid_ds, test_ds
+    args.train_data_meta=/jizhicfs/marvinhjia/njw1123/test_data/test.json
+    args.train_data_dir=/jizhicfs/marvinhjia/njw1123/test_data
+    args.video_sample_size=960
+    args.video_sample_stride=2
+    args.video_sample_n_frames=81
+    args.video_repeat=1
+    args.image_sample_size=1024
+    args.enable_bucket=False
+    
+    train_dataset = ImageVideoDataset(
+        args.train_data_meta, args.train_data_dir,
+        video_sample_size=args.video_sample_size, video_sample_stride=args.video_sample_stride, video_sample_n_frames=args.video_sample_n_frames, 
+        video_repeat=args.video_repeat, 
+        image_sample_size=args.image_sample_size,
+        enable_bucket=args.enable_bucket, enable_inpaint=True if args.train_mode != "normal" else False,
+    )
+    
+    batch_sampler_generator = torch.Generator().manual_seed(args.seed)
+    dp_size = parallel_state.get_data_parallel_world_size()
+    mini_batch_size = args.mciro_batch_size * dp_size
+    batch_sampler = ImageVideoSampler(RandomSampler(train_dataset, generator=batch_sampler_generator), train_dataset, mini_batch_size)
+    train_dataloader = torch.utils.data.DataLoader(
+        train_dataset,
+        batch_sampler=batch_sampler, 
+        persistent_workers=True if args.dataloader_num_workers != 0 else False,
+        num_workers=args.dataloader_num_workers,
+        worker_init_fn=worker_init_fn(args.seed + accelerator.process_index)
+    )
+
+    return train_dataloader, train_dataloader, train_dataloader
+    
+
+
+    
+
+    # return train_ds, valid_ds, test_ds
 
 
 if __name__ == "__main__":

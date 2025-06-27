@@ -263,8 +263,8 @@ class WanTransformer3DModel(LanguageModule):
         if not isinstance(input_tensor, list):
             input_tensor = [input_tensor]
 
-        assert len(input_tensor) == 1, 'input_tensor should only be length 1 for gpt/bert'
-        self.decoder.set_input_tensor(input_tensor[0])
+        # assert len(input_tensor) == 1, 'input_tensor should only be length 1 for gpt/bert'
+        self.decoder.set_input_tensor(input_tensor)
 
 
     def unpatchify(self, x, grid_sizes):
@@ -305,6 +305,7 @@ class WanTransformer3DModel(LanguageModule):
         attention_mask: Tensor,
         clip_fea: Tensor = None,
         y: Tensor = None,
+        target: Tensor = None,
         y_camera: Tensor = None,
         full_ref: Tensor = None,
         cond_flag: bool = True,
@@ -362,7 +363,7 @@ class WanTransformer3DModel(LanguageModule):
             self.freqs = self.freqs.cuda()
     
     
-        x = self.decoder(
+        x, grid_sizes = self.decoder(
             hidden_states=x,
             e = e0,
             attention_mask=attention_mask,
@@ -382,8 +383,61 @@ class WanTransformer3DModel(LanguageModule):
             x = x = torch.stack(x)
             return x
         else:
-            x = torch.cat([x, context], dim = 1)
-            return x
+            # max_seqlen = 100000
+            # seq_len = x.size(1)
+            # assert max_seqlen >= seq_len
+            # # x_100000 = 
+            # x_shape = x.shape
+            # context_shape = context.shape
+            # target_shape = target.shape
+            # grid_sizes_shape = grid_sizes.shape
+            # x_padding_zero = torch.cat([x, torch.zeros((x.size(0), max_seqlen - seq_len, x.size(1)), device=x.device)], dim = 1)
+            # x_padding_zero_flattn = x_padding_zero.reshape(-1)
+            # context_flattn = 
+            
+            # print("xxx shape", x.shape)
+            # print("context shape", context.shape)
+            # print("target shape", target.shape)
+            # print("grid_sizes", grid_sizes)
+            # x = torch.cat([x, context], dim = 1)
+            max_seqlen = 100000
+            seq_len = x.size(1)
+            assert max_seqlen >= seq_len
+            
+            # 保存各个张量的原始形状
+            x_shape = torch.tensor(x.shape, device=x.device)
+            context_shape = torch.tensor(context.shape, device=x.device)
+            target_shape = torch.tensor(target.shape, device=x.device)
+            grid_sizes_shape = torch.tensor(grid_sizes.shape, device=x.device)
+
+            print("x_shape", x_shape)
+            print("context_shape", context_shape)
+            print("target_shape", target_shape)
+            print("grid_sizes_shape", grid_sizes_shape)
+            
+            # 补全 x 到 max_seqlen（第二维）
+            padding_len = max_seqlen - seq_len
+            x_padded = torch.cat([x, torch.zeros((x.size(0), padding_len, x.size(2)), device=x.device)], dim=1)
+            x_1d = x_padded.reshape(-1)
+            
+            # # 其他张量 flatten 成一维
+            context_1d = context.reshape(-1)
+            target_1d = target.reshape(-1)
+            
+            grid_sizes_1d = grid_sizes.reshape(-1)
+
+            final_tensor = torch.cat([
+                x_shape.to(torch.float16), x_1d.to(torch.float16),
+                context_shape.to(torch.float16), context_1d.to(torch.float16),
+                target_shape.to(torch.float16), target_1d.to(torch.float16),
+                grid_sizes_shape.to(torch.float16), grid_sizes_1d.to(torch.float16)
+            ])
+            print("final_tensor shape", final_tensor.shape)
+            print("final_tensor", final_tensor[0])
+            print("final_tensor", final_tensor.dtype)
+            return final_tensor
+            
+            # return [x_shape, x_padded, context, target_shape, target, grid_sizes]
             
 
 

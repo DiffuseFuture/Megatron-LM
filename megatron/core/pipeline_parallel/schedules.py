@@ -287,10 +287,12 @@ def forward_step(
     with context_manager:
         if checkpoint_activations_microbatch is None:
             output_tensor, loss_func = forward_step_func(data_iterator, model)
+            print("output_tensor0", len(output_tensor))
         else:
             output_tensor, loss_func = forward_step_func(
                 data_iterator, model, checkpoint_activations_microbatch
             )
+            
 
     model_vp_stage = getattr(model, "vp_stage", None)
     if vp_stage is not None and model_vp_stage is not None:
@@ -362,7 +364,11 @@ def forward_step(
 
     if unwrap_output_tensor:
         return output_tensor, num_tokens
-    return [output_tensor], num_tokens
+
+    if not isinstance(output_tensor, list):
+        return [output_tensor], num_tokens
+    else:
+        return output_tensor, num_tokens
 
 
 def backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, config):
@@ -1642,7 +1648,12 @@ def get_tensor_shapes(
     If model has an encoder & decoder and rank is at the boundary, send one tensor.
     Otherwise, send one tensor.
     """
-    tensor_shapes = [([micro_batch_size, seq_length + context_seq_length, config.hidden_size])]
+
+# return [x_shape, x_padded, context, target_shape, target, grid_sizes]
+
+    # tensor_shapes = [([micro_batch_size, seq_length + context_seq_length, config.hidden_size])]
+    # tensor_shapes = [(3,), (1, 100000,   512), (1, 769, 512), (5,), (1, 16, 21, 120, 120), (1, 3)]
+    tensor_shapes = [(56432144,)]
 
     # seq_length = seq_length // parallel_state.get_context_parallel_world_size()
     # if model_type == ModelType.encoder_and_decoder:
@@ -1671,13 +1682,16 @@ def get_tensor_shapes(
 def recv_forward(tensor_shapes, config, is_first_stage):
     """Wrapper for p2p_communication.recv_forward used with non-interleaving schedule."""
     input_tensors = []
+    print("recv tensor shape list", tensor_shapes)
     for tensor_shape in tensor_shapes:
         if tensor_shape is None:
             input_tensors.append(None)
         else:
+            print("recv tensor shape", tensor_shape)
             input_tensors.append(
                 p2p_communication.recv_forward(tensor_shape, config, is_first_stage)
             )
+    
     return input_tensors
 
 
@@ -1698,9 +1712,12 @@ def send_forward(output_tensors, tensor_shapes, config, is_last_stage):
     """Wrapper for p2p_communication.send_forward used with non-interleaving schedule."""
     if not isinstance(output_tensors, list):
         output_tensors = [output_tensors]
+    print("send tensor shape", len(output_tensors))
+    print("send tensor", len(output_tensors))
     for output_tensor, tensor_shape in zip(output_tensors, tensor_shapes):
         if tensor_shape is None:
             continue
+        print("send tensor shape", tensor_shape, output_tensor.shape)
         p2p_communication.send_forward(output_tensor, config, is_last_stage)
 
 
@@ -1720,6 +1737,8 @@ def send_forward_recv_backward(output_tensors, tensor_shapes, config, is_last_st
     if not isinstance(output_tensors, list):
         output_tensors = [output_tensors]
     output_tensor_grads = []
+    print("recv tensor", len(output_tensors))
+    print("recv tensor", len(tensor_shapes))
     for output_tensor, tensor_shape in zip(output_tensors, tensor_shapes):
         if tensor_shape is None:
             output_tensor_grads.append(None)
@@ -1900,6 +1919,7 @@ def forward_backward_pipelining_without_interleaving(
             current_microbatch=i,
             encoder_decoder_xattn=encoder_decoder_xattn,
         )
+        print("output_tensor", len(output_tensor))
         send_forward(
             output_tensor, send_tensor_shapes, config, parallel_state.is_pipeline_last_stage()
         )
@@ -1919,6 +1939,7 @@ def forward_backward_pipelining_without_interleaving(
             recv_tensor_shapes, config, parallel_state.is_pipeline_first_stage()
         )
 
+    print("start steady")
     # Run 1F1B in steady state.
     for i in range(num_microbatches_remaining):
         last_iteration = i == (num_microbatches_remaining - 1)
@@ -1948,6 +1969,7 @@ def forward_backward_pipelining_without_interleaving(
             encoder_decoder_xattn=encoder_decoder_xattn,
         )
         total_num_tokens += num_tokens
+
 
         if forward_only:
             send_forward(
