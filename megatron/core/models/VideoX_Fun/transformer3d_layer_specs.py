@@ -52,6 +52,83 @@ except ImportError:
 from megatron.core.transformer.torch_norm import WanRMSNorm, WanLayerNorm
 
 
+def get_transformer3d_transformer_engine_block_spec(
+    num_experts: Optional[int] = None,
+    moe_grouped_gemm: Optional[bool] = False,
+    qk_layernorm: Optional[bool] = False,
+    multi_latent_attention: Optional[bool] = False,
+    fp8: Optional[str] = None,  # pylint: disable=unused-arguments
+    moe_use_legacy_grouped_gemm: Optional[bool] = False,
+    normalization: Optional[str] = None,
+    qk_l2_norm: Optional[bool] = False,
+) -> ModuleSpec:
+    """Use this spec for an implementation using only modules in Megatron-Core.
+
+
+    Args:
+        num_experts (int, optional): Number of experts. Defaults to None.
+        moe_grouped_gemm (bool, optional): To use Grouped GEMM. Defaults to False.
+        qk_layernorm (bool, optional): To use layernorm for queries/keys. Defaults to False.
+        fp8 (str, optional): Deprecated. For temporary Nemo compatibility.
+        moe_use_legacy_grouped_gemm (bool, optional): Force use the legacy GroupedMLP.
+                                                      Defaults to False.
+        qk_l2_norm (bool, optional): To use l2 norm for queries/keys. Defaults to False.
+
+    Returns:
+        ModuleSpec: Module specification with Megatron-Core modules
+    """
+
+
+    mlp = get_mlp_module_spec(
+        use_te=True,
+        num_experts=num_experts,
+        moe_grouped_gemm=moe_grouped_gemm,
+        moe_use_legacy_grouped_gemm=moe_use_legacy_grouped_gemm,
+    )
+
+
+    return ModuleSpec(
+        module=Transformer3dLayer,
+        submodules=TransformerLayerSubmodules(
+            input_layernorm=WanLayerNorm,
+            self_attention=ModuleSpec(
+                module=WanSelfAttention,
+                params={"attn_mask_type": AttnMaskType.no_mask},
+                submodules=SelfAttentionSubmodules(
+                    linear_qkv=TEColumnParallelLinear,
+                    core_attention=TEDotProductAttention,
+                    linear_proj=TERowParallelLinear,
+                    q_layernorm=WanRMSNorm,
+                    k_layernorm=WanRMSNorm,
+                ),
+            ),
+            cross_attention=ModuleSpec(
+                module=WanCrossAttention,
+                params={"attn_mask_type": AttnMaskType.padding},
+                submodules=WanCrossAttentionSubmodules(
+                    linear_q=TEColumnParallelLinear,
+                    linear_kv=TEColumnParallelLinear,
+                    core_attention=TEDotProductAttention,
+                    linear_proj=TERowParallelLinear,
+                    q_layernorm=WanRMSNorm,
+                    k_layernorm=WanRMSNorm,  
+                    linear_kv_img=TEColumnParallelLinear,
+                    k_img_layernorm=WanRMSNorm,
+                ),
+            ),
+            # self_attn_bda=get_bias_dropout_add,
+            pre_mlp_layernorm=WanLayerNorm,
+            mlp=mlp,
+            # mlp_bda=get_bias_dropout_add,
+            sharded_state_dict_keys_map={
+                'input_layernorm.': 'self_attention.linear_qkv.layer_norm_',
+                'pre_mlp_layernorm.': 'mlp.linear_fc1.layer_norm_',
+            },
+        ),
+    )
+
+
+
 def get_transformer3d_layer_local_spec(
     num_experts: Optional[int] = None,
     moe_grouped_gemm: Optional[bool] = False,
@@ -93,7 +170,7 @@ def get_transformer3d_layer_local_spec(
             input_layernorm=WanLayerNorm,
             self_attention=ModuleSpec(
                 module=WanSelfAttention,
-                params={"attn_mask_type": AttnMaskType.arbitrary},
+                params={"attn_mask_type": AttnMaskType.no_mask},
                 submodules=SelfAttentionSubmodules(
                     linear_qkv=ColumnParallelLinear,
                     core_attention=TEDotProductAttention,

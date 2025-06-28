@@ -898,10 +898,11 @@ class Transformer3DBlock(MegatronModule):
     
         # 读取和重建每个张量
         x_shape = read_shape(x_shape_len)
-        x_padded_shape = (x_shape[0], 100000, x_shape[2])  # 注意固定用了 max_seqlen
+        print("x_shape", x_shape)
+        x_padded_shape = (100000, x_shape[1], x_shape[2])  # 注意固定用了 max_seqlen
         x_numel = torch.tensor(x_padded_shape).prod().item()
         x_padded = final_tensor[ptr:ptr + x_numel].reshape(x_padded_shape)
-        x = x_padded[:, :x_shape[1], :]  # 切掉 padding
+        x = x_padded[:75600, :, :]  # 切掉 padding
         ptr += x_numel
     
         context_shape = read_shape(context_shape_len)
@@ -982,10 +983,10 @@ class Transformer3DBlock(MegatronModule):
             # assert(seq_len + context_seqlen == seqlen_sum)
             # context = hidden_states[:, seq_len:, :]
             # hidden_states = hidden_states[:, :seq_len, :]
-            hidden_state_seq_len = hidden_states.size(1)
-            q_mask = torch.zeros((1, 1, 1, hidden_state_seq_len), dtype=torch.bool).cuda()
-            kv_mask = torch.zeros((1, 1, 1, 512), dtype=torch.bool).cuda()
-            kv_mask_img = torch.zeros((1, 1, 1, 257), dtype=torch.bool).cuda()
+            hidden_state_seq_len = hidden_states.size(0)
+            q_mask = torch.zeros((1, hidden_state_seq_len), dtype=torch.bool).cuda()
+            kv_mask = torch.zeros((1, 512), dtype=torch.bool).cuda()
+            kv_mask_img = torch.zeros((1, 257), dtype=torch.bool).cuda()
             context_mask = (q_mask, kv_mask, kv_mask_img)
 
 

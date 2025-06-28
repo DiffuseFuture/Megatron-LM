@@ -300,7 +300,7 @@ def apply_rotary_pos_emb_with_cos_sin(
 
 
 def rope_apply(x, grid_sizes, freqs):
-    
+
     n, c = x.size(2), x.size(3) // 2
 
     # split freqs
@@ -312,7 +312,7 @@ def rope_apply(x, grid_sizes, freqs):
         seq_len = f * h * w
 
         # precompute multipliers
-        x_i = torch.view_as_complex(x[i, :seq_len].to(torch.float32).reshape(
+        x_i = torch.view_as_complex(x[: seq_len, i].to(torch.float32).reshape(
             seq_len, n, -1, 2))
         freqs_i = torch.cat([
             freqs[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
@@ -323,8 +323,8 @@ def rope_apply(x, grid_sizes, freqs):
 
         # apply rotary embedding
         x_i = torch.view_as_real(x_i * freqs_i).flatten(2)
-        x_i = torch.cat([x_i, x[i, seq_len:]])
+        x_i = torch.cat([x_i, x[seq_len:, i]])
 
         # append to collection
         output.append(x_i)
-    return torch.stack(output).to(torch.float16)
+    return torch.stack(output, dim=1).to(torch.float16)

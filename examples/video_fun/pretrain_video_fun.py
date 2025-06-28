@@ -14,6 +14,7 @@ import numpy as np
 from diffusers import DDIMScheduler, FlowMatchEulerDiscreteScheduler
 import torchvision.transforms.functional as TF
 from PIL import Image
+from megatron.core.packed_seq_params import PackedSeqParams
 
 
 
@@ -35,6 +36,8 @@ from megatron.core.transformer.module import Float16Module
 
 from megatron.core.models.VideoX_Fun.transformer3d_layer_specs import (
     get_transformer3d_layer_local_spec,
+    get_transformer3d_transformer_engine_block_spec,
+
 )
 
 from megatron.core.models.T5.t5_spec import (
@@ -135,7 +138,7 @@ def model_provider(
         global t5_model, tokenizer, noise_scheduler, vae_model, clip_model
         
         tokenizer = AutoTokenizer.from_pretrained(
-            os.path.join("/jizhicfs/marvinhjia/njw1123/dataroot/models/alibaba-pai/Wan2.1-Fun-V1.1-1.3B-InP", 
+            os.path.join("/root/add_dit/models/alibaba-pai/Wan2.1-Fun-V1.1-1.3B-InP", 
             wan_config['text_encoder_kwargs'].get('tokenizer_subpath', 'tokenizer')),
         )
 
@@ -147,7 +150,7 @@ def model_provider(
         t5_config = copy.deepcopy(config)
         encoder_config = copy.deepcopy(config)
 
-        en_block_spec = get_t5_encoder_with_local_block_spec(
+        en_block_spec = get_t5_encoder_with_transformer_engine_block_spec(
             config.num_layers
         )
 
@@ -178,7 +181,7 @@ def model_provider(
         # init vae
         vae_config = copy.deepcopy(config)
         
-        pretrained_model_path = "/jizhicfs/marvinhjia/MLSys/wan/Wan2.1-Fun-V1.1-1.3B-InP/Wan2.1_VAE.pth" 
+        pretrained_model_path = "/root/add_dit/models/alibaba-pai/Wan2.1-Fun-V1.1-1.3B-InP/Wan2.1_VAE.pth" 
         vae_model = WanVae(config, pretrained_model_path).to(torch.float16).cuda(torch.cuda.current_device())
         vae_model.requires_grad_(False)
         # init clip
@@ -194,7 +197,7 @@ def model_provider(
         
 
     
-    transformer_layer_spec = get_transformer3d_layer_local_spec()
+    transformer_layer_spec = get_transformer3d_transformer_engine_block_spec()
 
     global dit_model
     dit_model = WanTransformer3DModel(
@@ -366,7 +369,8 @@ def forward_step(data_iterator, model: WanTransformer3DModel):
             inpaint_latents = torch.concat([mask, mask_latents], dim=1)
             inpaint_latents = t2v_flag[:, None, None, None, None] * inpaint_latents
 
-            clip_mask = torch.zeros(257,257).to(torch.bool).cuda()
+            # clip_mask = torch.zeros(1, 1, 257,257).to(torch.bool).cuda()
+            clip_mask = None
             print("clip_pixel_values", clip_pixel_values.shape)
             clip_context = []
             for clip_input in clip_pixel_values:
@@ -392,17 +396,18 @@ def forward_step(data_iterator, model: WanTransformer3DModel):
                 return_tensors="pt"
             )
             text_input_ids = prompt_ids.input_ids
-            prompt_attention_mask = prompt_ids.attention_mask
+            prompt_attention_mask = prompt_ids.attention_mask.cuda()
 
 
             seq_lens = prompt_attention_mask.gt(0).sum(dim=1).long()
             print("seq_lens", seq_lens)
     
             b, s = prompt_attention_mask.size(0), prompt_attention_mask.size(1)
-            mask = torch.zeros((b, 1, s, s), device=latents.device, dtype = torch.bool)
+            # mask = torch.zeros((b, 1, s, s), device=latents.device, dtype = torch.bool)
+            # print("prompt_attention_mask shape", prompt_attention_mask.shape)
 
             print("text_input_ids shape", text_input_ids.shape)
-            context = t5_model(text_input_ids.cuda(), None, mask, None, None)
+            context = t5_model(text_input_ids.cuda(), None, prompt_attention_mask, None, None)
             context = context.transpose(0, 1).contiguous()
             print("context shape", context.shape)
             context = [u[:v] for u, v in zip(context, seq_lens)]
@@ -422,15 +427,33 @@ def forward_step(data_iterator, model: WanTransformer3DModel):
             context_seqlen = seq_lens[0] + 257
             grid_sizes = torch.tensor(grid_sizes).cuda()
 
-            q_mask = torch.zeros((1, 1, 1, hidden_state_seq_len), dtype=torch.bool).cuda()
-            kv_mask = torch.zeros((1, 1, 1, 512), dtype=torch.bool).cuda()
-            kv_mask_img = torch.zeros((1, 1, 1, 257), dtype=torch.bool).cuda()
+            q_mask = torch.zeros((1, hidden_state_seq_len), dtype=torch.bool).cuda()
+            kv_mask = torch.zeros((1, 512), dtype=torch.bool).cuda()
+            kv_mask_img = torch.zeros((1, 257), dtype=torch.bool).cuda()
             context_mask = (q_mask, kv_mask, kv_mask_img)
+            # attn_mask = torch.zeros((hidden_state_seq_len, hidden_state_seq_len), dtype=torch.bool).cuda()
+            attn_mask = None
+            # attn_mask = torch.tensor([75600], dtype=torch.int32).cuda().reshape((-1, 1))
+            # print()
+            # cu_seqlens = torch.tensor([0, hidden_state_seq_len], dtype=torch.int32, device=device)
+
+            # packed_seq_params = PackedSeqParams(
+            #     qkv_format="thd",  # 如果你不清楚，先设为 None，后面可调整为 'thd' 或 'bshd'
+            #     cu_seqlens_q=cu_seqlens,
+            #     cu_seqlens_kv=cu_seqlens,
+            #     cu_seqlens_q_padded=None,
+            #     cu_seqlens_kv_padded=None,
+            #     max_seqlen_q=torch.tensor(hidden_state_seq_len, dtype=torch.int32, device=device),
+            #     max_seqlen_kv=torch.tensor(hidden_state_seq_len, dtype=torch.int32, device=device),
+            # )
+            # noisy_latents = noisy_latents.transpose(0, 1).contiguous()
 
             print("noisy_latents shape", noisy_latents.shape)
             print("timestep", timestep)
             for u in context:
                 print("context shape", u.shape)
+            print("noisy_latents shape", noisy_latents.shape)
+            print("")
         else:
             noisy_latents = None
             context = None
@@ -442,10 +465,11 @@ def forward_step(data_iterator, model: WanTransformer3DModel):
             timestep = torch.tensor([0]).cuda()
             inpaint_latents = None
             target = None
+            attn_mask = None
             
         
         output_tensor = model(noisy_latents, timestep, context, context_mask, hidden_state_seq_len, 
-                                context_seqlen, grid_sizes, None, clip_fea, inpaint_latents, target)
+                                context_seqlen, grid_sizes, attn_mask, clip_fea, inpaint_latents, target)
             
     
 
@@ -509,8 +533,8 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
         
         args = get_args()
     
-        args.train_data_meta="/jizhicfs/marvinhjia/MLSys/wan/ft_local/test_data/test.json"
-        args.train_data_dir="/jizhicfs/marvinhjia/MLSys/wan/ft_local/test_data"
+        args.train_data_meta="/root/add_dit/test_data/test.json"
+        args.train_data_dir="/root/add_dit/test_data"
         args.video_sample_size=960
         args.video_sample_stride=2
         args.video_sample_n_frames=81

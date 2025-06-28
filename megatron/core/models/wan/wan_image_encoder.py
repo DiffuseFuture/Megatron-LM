@@ -7,6 +7,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchvision.transforms as T
+from megatron.core.transformer.enums import AttnMaskType
 
 from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
 from megatron.core.models.common.vision_module.vision_module import VisionModule
@@ -64,6 +65,7 @@ def get_wan_clip_spec():
     visual_attn_block = WanCLIPViTAttnBlockSubmodules(
         self_attention = ModuleSpec(
             module = SelfAttention,
+            params={"attn_mask_type": AttnMaskType.arbitrary},
             submodules = SelfAttentionSubmodules(
                 linear_qkv=ColumnParallelLinear,
                 core_attention=DotProductAttention,
@@ -93,6 +95,7 @@ def get_wan_clip_spec_te():
     visual_attn_block = WanCLIPViTAttnBlockSubmodules(
         self_attention = ModuleSpec(
             module = SelfAttention,
+            params={"attn_mask_type": AttnMaskType.arbitrary},
             submodules = SelfAttentionSubmodules(
                 linear_qkv=TEColumnParallelLinear,
                 core_attention=TEDotProductAttention,
@@ -214,6 +217,7 @@ class WanCLIPViTAttentionBlock(VisionModule):
             config,
             submodules = wan_clip_vit_attn_block_spec.self_attention.submodules,
             layer_number=1,
+            attn_mask_type = AttnMaskType.no_mask
         )
         self.norm2 = build_module(
             NORM_IMPL,

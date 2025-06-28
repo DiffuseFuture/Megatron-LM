@@ -309,6 +309,7 @@ class WanTransformer3DModel(LanguageModule):
         y_camera: Tensor = None,
         full_ref: Tensor = None,
         cond_flag: bool = True,
+        packed_seq_params: Optional[PackedSeqParams] = None,
     ) -> Tensor:
         """Forward function of the GPT Model This function passes the input tensors
         through the embedding layer, and then the decoeder and finally into the post
@@ -351,6 +352,12 @@ class WanTransformer3DModel(LanguageModule):
                 context_clip = self.img_emb(clip_fea)  # bs x 257 x dim
                 context = torch.concat([context_clip, context], dim=1)
             
+            x = x.transpose(0, 1).contiguous()
+            context = context.transpose(0, 1).contiguous()
+            print("xxx shape", x.shape)
+            print("context shape", context.shape)
+
+            
 
         with amp.autocast(dtype=torch.float32):
             e = self.time_embedding(
@@ -362,7 +369,16 @@ class WanTransformer3DModel(LanguageModule):
             assert device.type == 'cuda', f"Expected CUDA device, got {device}"
             self.freqs = self.freqs.cuda()
     
-    
+        # print("x shape:", x.shape)
+        # print("e0 shape:", e0.shape)
+        # print("attention_mask shape:", attention_mask.shape if attention_mask is not None else None)
+        # print("seq_len:", seq_len)
+        # print("context_seqlen:", context_seqlen)
+        # print("self.freqs shape:", self.freqs.shape if hasattr(self, 'freqs') else None)
+        # print("context shape:", context.shape if context is not None else None)
+        # # print("context_mask shape:", context_mask.shape if context_mask is not None else None)
+        # print("grid_sizes:", grid_sizes)
+
         x, grid_sizes = self.decoder(
             hidden_states=x,
             e = e0,
@@ -373,12 +389,13 @@ class WanTransformer3DModel(LanguageModule):
             context=context,
             context_mask=context_mask,
             grid_sizes=grid_sizes,
-            packed_seq_params=None,
+            packed_seq_params=packed_seq_params,
         )
 
         
         if parallel_state.is_pipeline_last_stage():
             x = self.head(x, e)
+            x = x.transpose(0, 1).contiguous()
             x = self.unpatchify(x, grid_sizes)
             x = x = torch.stack(x)
             return x
@@ -401,7 +418,7 @@ class WanTransformer3DModel(LanguageModule):
             # print("grid_sizes", grid_sizes)
             # x = torch.cat([x, context], dim = 1)
             max_seqlen = 100000
-            seq_len = x.size(1)
+            seq_len = x.size(0)
             assert max_seqlen >= seq_len
             
             # 保存各个张量的原始形状
@@ -417,7 +434,7 @@ class WanTransformer3DModel(LanguageModule):
             
             # 补全 x 到 max_seqlen（第二维）
             padding_len = max_seqlen - seq_len
-            x_padded = torch.cat([x, torch.zeros((x.size(0), padding_len, x.size(2)), device=x.device)], dim=1)
+            x_padded = torch.cat([x, torch.zeros((padding_len, x.size(1), x.size(2)), device=x.device)], dim=0)
             x_1d = x_padded.reshape(-1)
             
             # # 其他张量 flatten 成一维
