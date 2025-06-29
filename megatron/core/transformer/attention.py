@@ -754,9 +754,6 @@ class Attention(MegatronModule, ABC):
         else:
             if inference_context is None or inference_context.is_static_batching():
                 # Static batching attention kernel.
-                print("query.shape", query.shape)
-                print("key.shape", key.shape)
-                print("value.shape", value.shape)
                 # print("attention_mask.shape", attention_mask.shape)
                 core_attn_out = self.core_attention(
                     query,
@@ -1332,9 +1329,6 @@ class WanSelfAttention(Attention):
             # query = query.transpose(0, 1).contiguous()
             # key = key.transpose(0, 1).contiguous()
             # value = value.transpose(0, 1).contiguous()
-            print("query shape", query.shape)
-            print("key shape", key.shape)
-            print("value shape", value.shape)
             # query = query.reshape(-1, query.size(2), query.size(3))  # → [75600, 8, 64]
             # key = key.reshape(-1, key.size(2), key.size(3))  # → [75600, 8, 64]
             # value = value.reshape(-1, value.size(2), value.size(3))  # → [75600, 8, 64]
@@ -1548,13 +1542,6 @@ class WanCrossAttention(Attention):
             )
 
             attention_mask_x = (attention_mask[0], attention_mask[1])
-            print("query shape", query.shape)
-            print("key shape", key.shape)
-            print("value shape", value.shape)
-            print("attention_mask_x shape", attention_mask[0].shape, attention_mask[1].shape)
-            # query = query.transpose(0, 1).contiguous()
-            # key = key.transpose(0, 1).contiguous()
-            # value = value.transpose(0, 1).contiguous()
             core_attn_out = self.core_attention(
                 query,
                 key,

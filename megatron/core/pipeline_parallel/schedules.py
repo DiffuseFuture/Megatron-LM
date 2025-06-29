@@ -287,7 +287,6 @@ def forward_step(
     with context_manager:
         if checkpoint_activations_microbatch is None:
             output_tensor, loss_func = forward_step_func(data_iterator, model)
-            print("output_tensor0", len(output_tensor))
         else:
             output_tensor, loss_func = forward_step_func(
                 data_iterator, model, checkpoint_activations_microbatch
@@ -399,7 +398,6 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, c
         output_tensor = [output_tensor]
     if not isinstance(output_tensor_grad, list):
         output_tensor_grad = [output_tensor_grad]
-
     # Backward pass.
     if output_tensor_grad[0] is None and config.grad_scale_func is not None:
         output_tensor[0] = config.grad_scale_func(output_tensor[0])
@@ -419,10 +417,16 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, c
     if input_tensor is not None:
         input_tensor_grad = []
         for x in input_tensor:
-            if x is None:
+            if x is None or x.grad is None:
                 input_tensor_grad.append(None)
+                # continue
             else:
                 input_tensor_grad.append(x.grad)
+    # if(len(input_tensor_grad) > 2):
+    #     input_tensor_grad = input_tensor_grad[:2]
+    if(len(input_tensor_grad) == 4 and input_tensor_grad[3] == None):
+        # c, h, w = input_tensor_grad[2].size(2), input_tensor_grad[2].size(3), input_tensor_grad[2].size(4)
+        input_tensor_grad[3] = torch.tensor([0, 0, 0], dtype=torch.float16).reshape(1, 1, 3).cuda() # fake
 
     # Handle single skip connection if it exists (encoder_hidden_state in
     # model with encoder and decoder).
@@ -1638,6 +1642,7 @@ def get_tensor_shapes(
     decoder_seq_length: int,
     config,
     encoder_decoder_xattn: bool,
+    is_forward: bool,
 ):
     """
     Determine right tensor sizes (based on position of rank with respect to split rank) and
@@ -1652,8 +1657,22 @@ def get_tensor_shapes(
 # return [x_shape, x_padded, context, target_shape, target, grid_sizes]
 
     # tensor_shapes = [([micro_batch_size, seq_length + context_seq_length, config.hidden_size])]
-    # tensor_shapes = [(3,), (1, 100000,   512), (1, 769, 512), (5,), (1, 16, 21, 120, 120), (1, 3)]
-    tensor_shapes = [(56432144,)]
+    # tensor_shapes = [(3,), (100000, 1, 512), (769, 1, 512), (5,), (1, 16, 6, 96, 168), (1, 3)]
+    # tensor_shapes = [(56432144,)]
+    # v torch.Size([3]) torch.int32
+    # v torch.Size([100000, 1, 512]) torch.float32
+    # v torch.Size([769, 1, 512]) torch.float16
+    # v torch.Size([5]) torch.int32
+    # v torch.Size([1, 16, 6, 96, 168]) torch.float16
+    # v torch.Size([1, 3]) torch.int64
+    if is_forward:
+        tensor_shapes = [(3, 1), (3, 1), (3, 1), (3, 1)] #fake shape
+        return tensor_shapes
+    else:
+        # tensor_shapes = [(3, 1), (3, 1)] #fake shape
+        tensor_shapes = [(3, 1), (3, 1), (3, 1), (3, 1)] #fake shape
+        return tensor_shapes
+    # dtype = [torch.int64]
 
     # seq_length = seq_length // parallel_state.get_context_parallel_world_size()
     # if model_type == ModelType.encoder_and_decoder:
@@ -1682,16 +1701,19 @@ def get_tensor_shapes(
 def recv_forward(tensor_shapes, config, is_first_stage):
     """Wrapper for p2p_communication.recv_forward used with non-interleaving schedule."""
     input_tensors = []
-    print("recv tensor shape list", tensor_shapes)
     for tensor_shape in tensor_shapes:
         if tensor_shape is None:
             input_tensors.append(None)
         else:
-            print("recv tensor shape", tensor_shape)
+            # old_pipeline_dtype = config.pipeline_dtype
+            # if(len(input_tensors) == 3):
+                # config.pipeline_dtype = torch.float64
             input_tensors.append(
                 p2p_communication.recv_forward(tensor_shape, config, is_first_stage)
             )
-    
+            # if(len(input_tensors) == 4):
+            #     config.pipeline_dtype = old_pipeline_dtype
+
     return input_tensors
 
 
@@ -1702,9 +1724,14 @@ def recv_backward(tensor_shapes, config, is_last_stage):
         if tensor_shape is None:
             output_tensor_grads.append(None)
         else:
+            # old_pipeline_dtype = config.pipeline_dtype
+            # if(len(output_tensor_grads) == 3):
+                # config.pipeline_dtype = torch.float64
             output_tensor_grads.append(
                 p2p_communication.recv_backward(tensor_shape, config, is_last_stage)
             )
+            # if(len(output_tensor_grads) == 4):
+                # config.pipeline_dtype = old_pipeline_dtype
     return output_tensor_grads
 
 
@@ -1712,13 +1739,15 @@ def send_forward(output_tensors, tensor_shapes, config, is_last_stage):
     """Wrapper for p2p_communication.send_forward used with non-interleaving schedule."""
     if not isinstance(output_tensors, list):
         output_tensors = [output_tensors]
-    print("send tensor shape", len(output_tensors))
-    print("send tensor", len(output_tensors))
     for output_tensor, tensor_shape in zip(output_tensors, tensor_shapes):
         if tensor_shape is None:
             continue
-        print("send tensor shape", tensor_shape, output_tensor.shape)
+        # old_pipeline_dtype = config.pipeline_dtype
+        # if tensor_shapes[-1] == tensor_shape:
+        #     config.pipeline_dtype = torch.float64
         p2p_communication.send_forward(output_tensor, config, is_last_stage)
+        # if tensor_shapes[-1] == output_tensor:
+        #     config.pipeline_dtype = old_pipeline_dtype
 
 
 def send_backward(input_tensor_grads, tensor_shapes, config, is_first_stage):
@@ -1726,9 +1755,14 @@ def send_backward(input_tensor_grads, tensor_shapes, config, is_first_stage):
     if not isinstance(input_tensor_grads, list):
         input_tensor_grads = [input_tensor_grads]
     for input_tensor_grad, tensor_shape in zip(input_tensor_grads, tensor_shapes):
-        if tensor_shape is None:
+        if tensor_shape is None or input_tensor_grad is None:
             continue
+        # old_pipeline_dtype = config.pipeline_dtype
+        # if tensor_shapes[-1] == tensor_shape:
+        #     config.pipeline_dtype = torch.float64
         p2p_communication.send_backward(input_tensor_grad, config, is_first_stage)
+        # if tensor_shapes[-1] == tensor_shape:
+        #     config.pipeline_dtype = old_pipeline_dtype
 
 
 def send_forward_recv_backward(output_tensors, tensor_shapes, config, is_last_stage):
@@ -1737,15 +1771,19 @@ def send_forward_recv_backward(output_tensors, tensor_shapes, config, is_last_st
     if not isinstance(output_tensors, list):
         output_tensors = [output_tensors]
     output_tensor_grads = []
-    print("recv tensor", len(output_tensors))
-    print("recv tensor", len(tensor_shapes))
     for output_tensor, tensor_shape in zip(output_tensors, tensor_shapes):
         if tensor_shape is None:
             output_tensor_grads.append(None)
             continue
+
+        # old_pipeline_dtype = config.pipeline_dtype
+        # if tensor_shapes[-1] == tensor_shape:
+        #     config.pipeline_dtype = torch.float64
         output_tensor_grad = p2p_communication.send_forward_recv_backward(
             output_tensor, tensor_shape, config, is_last_stage
         )
+        # if tensor_shapes[-1] == tensor_shape:
+        #     config.pipeline_dtype = old_pipeline_dtype
         output_tensor_grads.append(output_tensor_grad)
     return output_tensor_grads
 
@@ -1760,9 +1798,14 @@ def send_backward_recv_forward(input_tensor_grads, tensor_shapes, config, is_fir
         if tensor_shape is None:
             input_tensors.append(None)
             continue
+        # old_pipeline_dtype = config.pipeline_dtype
+        # if tensor_shapes[-1] == tensor_shape:
+            # config.pipeline_dtype = torch.float64
         input_tensor = p2p_communication.send_backward_recv_forward(
             input_tensor_grad, tensor_shape, config, is_first_stage
         )
+        # if tensor_shapes[-1] == tensor_shape:
+        #     config.pipeline_dtype = old_pipeline_dtype
         input_tensors.append(input_tensor)
     return input_tensors
 
@@ -1856,7 +1899,7 @@ def forward_backward_pipelining_without_interleaving(
     encoder_decoder_xattn = get_model_xattn(model)
 
     rank = parallel_state.get_pipeline_model_parallel_rank()
-    recv_tensor_shapes = get_tensor_shapes(
+    forward_recv_tensor_shapes = get_tensor_shapes(
         rank=rank - 1,
         model_type=model_type,
         seq_length=seq_length,
@@ -1865,8 +1908,9 @@ def forward_backward_pipelining_without_interleaving(
         decoder_seq_length=decoder_seq_length,
         config=config,
         encoder_decoder_xattn=encoder_decoder_xattn,
+        is_forward=True,
     )
-    send_tensor_shapes = get_tensor_shapes(
+    forward_send_tensor_shapes = get_tensor_shapes(
         rank=rank,
         model_type=model_type,
         seq_length=seq_length,
@@ -1875,7 +1919,32 @@ def forward_backward_pipelining_without_interleaving(
         decoder_seq_length=decoder_seq_length,
         config=config,
         encoder_decoder_xattn=encoder_decoder_xattn,
+        is_forward=True,
     )
+
+    backward_recv_tensor_shapes = get_tensor_shapes(
+        rank=rank - 1,
+        model_type=model_type,
+        seq_length=seq_length,
+        context_seq_length=context_seq_length,
+        micro_batch_size=micro_batch_size,
+        decoder_seq_length=decoder_seq_length,
+        config=config,
+        encoder_decoder_xattn=encoder_decoder_xattn,
+        is_forward=False,
+    )
+    backward_send_tensor_shapes = get_tensor_shapes(
+        rank=rank,
+        model_type=model_type,
+        seq_length=seq_length,
+        context_seq_length=context_seq_length,
+        micro_batch_size=micro_batch_size,
+        decoder_seq_length=decoder_seq_length,
+        config=config,
+        encoder_decoder_xattn=encoder_decoder_xattn,
+        is_forward=False,
+    )
+
     if adjust_tensor_shapes_fn is not None:
         recv_tensor_shapes, send_tensor_shapes = adjust_tensor_shapes_fn(
             recv_tensor_shapes, send_tensor_shapes
@@ -1903,7 +1972,7 @@ def forward_backward_pipelining_without_interleaving(
             checkpoint_activations_microbatch = None
 
         input_tensor = recv_forward(
-            recv_tensor_shapes, config, parallel_state.is_pipeline_first_stage()
+            forward_recv_tensor_shapes, config, parallel_state.is_pipeline_first_stage()
         )
         output_tensor, num_tokens = forward_step(
             forward_step_func,
@@ -1919,9 +1988,8 @@ def forward_backward_pipelining_without_interleaving(
             current_microbatch=i,
             encoder_decoder_xattn=encoder_decoder_xattn,
         )
-        print("output_tensor", len(output_tensor))
         send_forward(
-            output_tensor, send_tensor_shapes, config, parallel_state.is_pipeline_last_stage()
+            output_tensor, forward_send_tensor_shapes, config, parallel_state.is_pipeline_last_stage()
         )
         total_num_tokens += num_tokens
 
@@ -1936,10 +2004,9 @@ def forward_backward_pipelining_without_interleaving(
     # receive this tensor here.
     if num_microbatches_remaining > 0:
         input_tensor = recv_forward(
-            recv_tensor_shapes, config, parallel_state.is_pipeline_first_stage()
+            forward_recv_tensor_shapes, config, parallel_state.is_pipeline_first_stage()
         )
 
-    print("start steady")
     # Run 1F1B in steady state.
     for i in range(num_microbatches_remaining):
         last_iteration = i == (num_microbatches_remaining - 1)
@@ -1951,7 +2018,6 @@ def forward_backward_pipelining_without_interleaving(
             ) >= config.num_microbatches_with_partial_activation_checkpoints
         else:
             checkpoint_activations_microbatch = None
-
         output_tensor, num_tokens = forward_step(
             forward_step_func,
             data_iterator,
@@ -1973,7 +2039,7 @@ def forward_backward_pipelining_without_interleaving(
 
         if forward_only:
             send_forward(
-                output_tensor, send_tensor_shapes, config, parallel_state.is_pipeline_last_stage()
+                output_tensor, forward_send_tensor_shapes, config, parallel_state.is_pipeline_last_stage()
             )
 
             if not last_iteration:
@@ -1983,7 +2049,7 @@ def forward_backward_pipelining_without_interleaving(
 
         else:
             output_tensor_grad = send_forward_recv_backward(
-                output_tensor, send_tensor_shapes, config, parallel_state.is_pipeline_last_stage()
+                output_tensor, backward_send_tensor_shapes, config, parallel_state.is_pipeline_last_stage()
             )
 
             # Add input_tensor and output_tensor to end of list.
@@ -2010,19 +2076,20 @@ def forward_backward_pipelining_without_interleaving(
                 input_tensor = None
                 send_backward(
                     input_tensor_grad,
-                    recv_tensor_shapes,
+                    backward_recv_tensor_shapes,
                     config,
                     parallel_state.is_pipeline_first_stage(),
                 )
             else:
                 input_tensor = send_backward_recv_forward(
                     input_tensor_grad,
-                    recv_tensor_shapes,
+                    forward_recv_tensor_shapes,
                     config,
                     parallel_state.is_pipeline_first_stage(),
                 )
 
     # Run cooldown backward passes.
+    
     if not forward_only:
         for i in range(num_warmup_microbatches):
 
@@ -2037,9 +2104,8 @@ def forward_backward_pipelining_without_interleaving(
 
             input_tensor = input_tensors.pop(0)
             output_tensor = output_tensors.pop(0)
-
             output_tensor_grad = recv_backward(
-                send_tensor_shapes, config, parallel_state.is_pipeline_last_stage()
+                backward_send_tensor_shapes, config, parallel_state.is_pipeline_last_stage()
             )
 
             input_tensor_grad = backward_step(
@@ -2048,7 +2114,7 @@ def forward_backward_pipelining_without_interleaving(
 
             send_backward(
                 input_tensor_grad,
-                recv_tensor_shapes,
+                backward_recv_tensor_shapes,
                 config,
                 parallel_state.is_pipeline_first_stage(),
             )

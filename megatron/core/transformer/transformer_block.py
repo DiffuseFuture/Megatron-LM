@@ -875,53 +875,7 @@ class Transformer3DBlock(MegatronModule):
         model's forward_step_func won't have it. This function is thus
         used by internal code to bypass the input provided by the
         forward_step_func"""
-        self.input_tensor = input_tensor[0]
-
-
-    def restore_from_tensor(self, final_tensor):
-
-        print("final_tensor", final_tensor.dtype)
-        print("first item", final_tensor[0])
-        ptr = 0
-    
-        # 维度数配置
-        x_shape_len = 3
-        context_shape_len = 3
-        target_shape_len = 5
-        grid_sizes_shape_len = 2
-    
-        def read_shape(n):
-            nonlocal ptr
-            shape = final_tensor[ptr:ptr + n].to(torch.int64)
-            ptr += n
-            return tuple(shape.tolist())
-    
-        # 读取和重建每个张量
-        x_shape = read_shape(x_shape_len)
-        print("x_shape", x_shape)
-        x_padded_shape = (100000, x_shape[1], x_shape[2])  # 注意固定用了 max_seqlen
-        x_numel = torch.tensor(x_padded_shape).prod().item()
-        x_padded = final_tensor[ptr:ptr + x_numel].reshape(x_padded_shape)
-        x = x_padded[:75600, :, :]  # 切掉 padding
-        ptr += x_numel
-    
-        context_shape = read_shape(context_shape_len)
-        context_numel = torch.tensor(context_shape).prod().item()
-        context = final_tensor[ptr:ptr + context_numel].reshape(context_shape)
-        ptr += context_numel
-    
-        target_shape = read_shape(target_shape_len)
-        target_numel = torch.tensor(target_shape).prod().item()
-        target = final_tensor[ptr:ptr + target_numel].reshape(target_shape)
-        ptr += target_numel
-    
-        grid_sizes_shape = read_shape(grid_sizes_shape_len)
-        grid_sizes_numel = torch.tensor(grid_sizes_shape).prod().item()
-        grid_sizes = final_tensor[ptr:ptr + grid_sizes_numel].reshape(grid_sizes_shape).to(dtype=torch.int64)
-        ptr += grid_sizes_numel
-    
-        return x, context, target, grid_sizes
-
+        self.input_tensor = input_tensor
 
         
 
@@ -936,6 +890,7 @@ class Transformer3DBlock(MegatronModule):
         context: Tensor,
         context_mask: Tensor,
         grid_sizes: Tensor,
+        target: Tensor,
         packed_seq_params: PackedSeqParams,
     ):
         """
@@ -972,17 +927,15 @@ class Transformer3DBlock(MegatronModule):
             hidden_states = hidden_states.unwrap()
 
         if not parallel_state.is_pipeline_first_stage():
-            hidden_states, context, target, grid_sizes = self.restore_from_tensor(self.input_tensor)
+            # hidden_states, context, target, grid_sizes = self.restore_from_tensor(self.input_tensor)
+            hidden_states = self.input_tensor[0]
+            context = self.input_tensor[1]
+            target = self.input_tensor[2]
+            grid_sizes = self.input_tensor[3]
+            grid_sizes = grid_sizes.reshape(grid_sizes.size(1), grid_sizes.size(2))
+            target = target.reshape(target.size(0), target.size(1), 
+                                    int(grid_sizes[0][0].item()), int(grid_sizes[0][1].item()) * 2, int(grid_sizes[0][2].item()) * 2)
 
-            print("after transfer hidden_states shape", hidden_states.shape)
-            print("after transfer context shape", context.shape)
-            print("after transfer target shape", target.shape)
-            print("after transfer grid_sizes", grid_sizes)
-            # hidden_states = self.input_tensor
-            # seqlen_sum = hidden_states.size(1)
-            # assert(seq_len + context_seqlen == seqlen_sum)
-            # context = hidden_states[:, seq_len:, :]
-            # hidden_states = hidden_states[:, :seq_len, :]
             hidden_state_seq_len = hidden_states.size(0)
             q_mask = torch.zeros((1, hidden_state_seq_len), dtype=torch.bool).cuda()
             kv_mask = torch.zeros((1, 512), dtype=torch.bool).cuda()
@@ -990,7 +943,7 @@ class Transformer3DBlock(MegatronModule):
             context_mask = (q_mask, kv_mask, kv_mask_img)
 
 
-        print("grid_sizes ", grid_sizes)
+
         # Viewless tensor.
         # - We only need to create a viewless tensor in the case of micro batch
         #   size (mbs) == 1, since in this case, 'hidden_states.transpose()'
@@ -1071,7 +1024,7 @@ class Transformer3DBlock(MegatronModule):
                 inp=hidden_states, requires_grad=True, keep_graph=True
             )
 
-        return hidden_states, grid_sizes
+        return hidden_states, grid_sizes, target
 
     def sharded_state_dict(
         self, prefix: str = '', sharded_offsets: tuple = (), metadata: dict = None

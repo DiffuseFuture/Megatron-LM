@@ -1157,9 +1157,6 @@ class Transformer3dLayer(MegatronModule, BaseTransformerLayer):
         pre_cross_attn_layernorm_output = self.pre_cross_attn_layernorm(hidden_states)
 
         # Cross attention.
-        print("pre_cross_attn_layernorm_output", pre_cross_attn_layernorm_output.shape)
-        print("context", context.shape)
-        print("attention_mask shape", context_mask[0].shape, context_mask[1].shape)
         attention_output_with_bias = self.cross_attention(
             pre_cross_attn_layernorm_output,
             attention_mask=context_mask,

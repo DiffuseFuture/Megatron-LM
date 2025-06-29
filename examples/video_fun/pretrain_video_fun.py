@@ -12,13 +12,26 @@ from modelscope import AutoTokenizer
 from einops import rearrange
 import numpy as np
 from diffusers import DDIMScheduler, FlowMatchEulerDiscreteScheduler
+import torch.nn.functional as F
+
+from diffusers.training_utils import (EMAModel,
+                                      compute_density_for_timestep_sampling,
+                                      compute_loss_weighting_for_sd3)
+
 import torchvision.transforms.functional as TF
 from PIL import Image
 from megatron.core.packed_seq_params import PackedSeqParams
+from bucket_sampler import (ASPECT_RATIO_512,
+                            ASPECT_RATIO_RANDOM_CROP_512,
+                            ASPECT_RATIO_RANDOM_CROP_PROB,
+                            AspectRatioBatchImageVideoSampler,
+                            RandomSampler, get_closest_ratio)
 
+from dataset_image_video import (ImageVideoDataset,
+                                                 ImageVideoSampler,
+                                                 get_random_mask)
 
-
-
+from torchvision import transforms
 from functools import partial
 from typing import List, Optional, Tuple, Union
 from megatron.core import parallel_state
@@ -29,7 +42,6 @@ from megatron.training import get_timers
 from megatron.training import get_tokenizer
 from megatron.core import mpu
 from megatron.core.enums import ModelType
-from dataset_image_video import ImageVideoDataset, ImageVideoSampler
 
 from megatron.core.enums import ModelType
 from megatron.core.transformer.module import Float16Module
@@ -80,6 +92,7 @@ tokenizer = None
 noise_scheduler = None
 vae_model = None
 clip_model = None
+sigmas = None
 
 
 
@@ -101,6 +114,8 @@ def model_provider(
         Union[GPTModel, megatron.legacy.model.GPTModel]: The returned model
     """
     args = get_args()
+    args.variable_seq_lengths = True
+    args.moe_token_dispatcher_type = "alltoall"
     wan_config = OmegaConf.load("wan_civitai.yaml")
 
     if has_nvidia_modelopt and modelopt_args_enabled(args):  # [ModelOpt]
@@ -135,15 +150,11 @@ def model_provider(
 
     if parallel_state.is_pipeline_first_stage():
 
-        global t5_model, tokenizer, noise_scheduler, vae_model, clip_model
+        global t5_model, tokenizer, vae_model, clip_model
         
         tokenizer = AutoTokenizer.from_pretrained(
             os.path.join("/root/add_dit/models/alibaba-pai/Wan2.1-Fun-V1.1-1.3B-InP", 
             wan_config['text_encoder_kwargs'].get('tokenizer_subpath', 'tokenizer')),
-        )
-
-        noise_scheduler = FlowMatchEulerDiscreteScheduler(
-            **filter_kwargs(FlowMatchEulerDiscreteScheduler, OmegaConf.to_container(wan_config['scheduler_kwargs']))
         )
         
         
@@ -196,6 +207,10 @@ def model_provider(
         clip_model.requires_grad_(False)
         
 
+    global noise_scheduler
+    noise_scheduler = FlowMatchEulerDiscreteScheduler(
+        **filter_kwargs(FlowMatchEulerDiscreteScheduler, OmegaConf.to_container(wan_config['scheduler_kwargs']))
+    )
     
     transformer_layer_spec = get_transformer3d_transformer_engine_block_spec()
 
@@ -264,10 +279,23 @@ def loss_func(
     if has_nvidia_modelopt and modelopt_args_enabled(args):  # [ModelOpt]
         return loss_func_modelopt(loss_mask, output_tensor, model=model)
 
-    losses = output_tensor.view(-1).float()
-    # loss_mask = loss_mask.view(-1).float()
-    # loss = torch.sum(losses * loss_mask)
-    loss = torch.sum(losses)
+
+
+    def custom_mse_loss(noise_pred, target, weighting=None, threshold=50):
+        diff = noise_pred - target
+        mse_loss = F.mse_loss(noise_pred, target, reduction='none')
+        mask = (diff.abs() <= threshold).float()
+        masked_loss = mse_loss * mask
+        if weighting is not None:
+            masked_loss = masked_loss * weighting
+        final_loss = masked_loss.mean()
+        return final_loss
+
+    output = output_tensor[0]
+    target = output_tensor[1]
+
+    weighting = compute_loss_weighting_for_sd3(weighting_scheme=None, sigmas=sigmas)
+    loss = custom_mse_loss(output.to(torch.float32), target.to(torch.float32), weighting.to(torch.float32))
 
     # Check individual rank losses are not NaN prior to DP all-reduce.
     rerun_state_machine = get_rerun_state_machine()
@@ -313,10 +341,10 @@ def forward_step(data_iterator, model: WanTransformer3DModel):
         data_iterator : Input data iterator
         model (GPTModel): The GPT Model
     """
-    print("start fwd")
     args = get_args()
     timers = get_timers()
     weight_dtype = torch.float16
+    global sigmas
 
     
     # Get the batch.
@@ -340,9 +368,7 @@ def forward_step(data_iterator, model: WanTransformer3DModel):
             mask_pixel_values = rearrange(mask_pixel_values, "b f c h w -> b c f h w")
             
             # latents = vae.encoder(pixel_values)
-            print("before vae pixel_values shape", pixel_values.shape)
             latents = vae_model.encode(pixel_values)[0].sample()
-            print("after vae latents shape", latents.shape)
     
             mask = rearrange(mask, "b f c h w -> b c f h w")
             mask = torch.concat(
@@ -371,18 +397,15 @@ def forward_step(data_iterator, model: WanTransformer3DModel):
 
             # clip_mask = torch.zeros(1, 1, 257,257).to(torch.bool).cuda()
             clip_mask = None
-            print("clip_pixel_values", clip_pixel_values.shape)
             clip_context = []
             for clip_input in clip_pixel_values:
                 clip_image = Image.fromarray(np.uint8(clip_input.float().cpu().numpy()))
                 clip_image = TF.to_tensor(clip_image).sub_(0.5).div_(0.5).to(device, weight_dtype)
-                print("clip_image[:, None, :, :]", clip_image[:, None, :, :].size())
                 clip_fea = clip_model([clip_image[:, None, :, :]], clip_mask)
                 zero_init_clip_in = np.random.choice([True, False], p=[0.1, 0.9])
                 clip_context.append(clip_fea if not zero_init_clip_in else torch.zeros_like(clip_fea))
                 
             clip_context = torch.cat(clip_context)
-            print("clip_context", clip_context.shape)
     
     
             # text
@@ -400,24 +423,22 @@ def forward_step(data_iterator, model: WanTransformer3DModel):
 
 
             seq_lens = prompt_attention_mask.gt(0).sum(dim=1).long()
-            print("seq_lens", seq_lens)
     
             b, s = prompt_attention_mask.size(0), prompt_attention_mask.size(1)
             # mask = torch.zeros((b, 1, s, s), device=latents.device, dtype = torch.bool)
             # print("prompt_attention_mask shape", prompt_attention_mask.shape)
 
-            print("text_input_ids shape", text_input_ids.shape)
             context = t5_model(text_input_ids.cuda(), None, prompt_attention_mask, None, None)
             context = context.transpose(0, 1).contiguous()
-            print("context shape", context.shape)
             context = [u[:v] for u, v in zip(context, seq_lens)]
 
             # noise
             noise = torch.randn(latents.size(), device=latents.device, generator=None, dtype=weight_dtype)
-            timestep, sigmas = get_timesteps_and_sigmas(noise_scheduler, latents, n_dim=latents.ndim, dtype=latents.dtype)
+            timestep, sigmas = get_timesteps_and_sigmas(noise_scheduler, args.micro_batch_size, n_dim=5, dtype=weight_dtype)
             noisy_latents = (1.0 - sigmas) * latents + sigmas * noise
     
             target = noise - latents
+            target.requires_grad_(False)
             
             grid_sizes = []
             for noisy_latent in noisy_latents:
@@ -425,35 +446,14 @@ def forward_step(data_iterator, model: WanTransformer3DModel):
 
             hidden_state_seq_len = grid_sizes[0][0] * grid_sizes[0][1] * grid_sizes[0][2] 
             context_seqlen = seq_lens[0] + 257
-            grid_sizes = torch.tensor(grid_sizes).cuda()
+            grid_sizes = torch.tensor(grid_sizes, dtype=torch.float16, requires_grad=False).cuda()
 
             q_mask = torch.zeros((1, hidden_state_seq_len), dtype=torch.bool).cuda()
             kv_mask = torch.zeros((1, 512), dtype=torch.bool).cuda()
             kv_mask_img = torch.zeros((1, 257), dtype=torch.bool).cuda()
             context_mask = (q_mask, kv_mask, kv_mask_img)
-            # attn_mask = torch.zeros((hidden_state_seq_len, hidden_state_seq_len), dtype=torch.bool).cuda()
             attn_mask = None
-            # attn_mask = torch.tensor([75600], dtype=torch.int32).cuda().reshape((-1, 1))
-            # print()
-            # cu_seqlens = torch.tensor([0, hidden_state_seq_len], dtype=torch.int32, device=device)
 
-            # packed_seq_params = PackedSeqParams(
-            #     qkv_format="thd",  # 如果你不清楚，先设为 None，后面可调整为 'thd' 或 'bshd'
-            #     cu_seqlens_q=cu_seqlens,
-            #     cu_seqlens_kv=cu_seqlens,
-            #     cu_seqlens_q_padded=None,
-            #     cu_seqlens_kv_padded=None,
-            #     max_seqlen_q=torch.tensor(hidden_state_seq_len, dtype=torch.int32, device=device),
-            #     max_seqlen_kv=torch.tensor(hidden_state_seq_len, dtype=torch.int32, device=device),
-            # )
-            # noisy_latents = noisy_latents.transpose(0, 1).contiguous()
-
-            print("noisy_latents shape", noisy_latents.shape)
-            print("timestep", timestep)
-            for u in context:
-                print("context shape", u.shape)
-            print("noisy_latents shape", noisy_latents.shape)
-            print("")
         else:
             noisy_latents = None
             context = None
@@ -462,7 +462,7 @@ def forward_step(data_iterator, model: WanTransformer3DModel):
             hidden_state_seq_len = None
             context_seqlen = None
             clip_fea = None
-            timestep = torch.tensor([0]).cuda()
+            timestep, sigmas = get_timesteps_and_sigmas(noise_scheduler, args.micro_batch_size, n_dim=5, dtype=weight_dtype)
             inpaint_latents = None
             target = None
             attn_mask = None
@@ -509,7 +509,7 @@ def forward_step(data_iterator, model: WanTransformer3DModel):
 
     # [ModelOpt]: model is needed to access ModelOpt distillation losses
     # loss_mask = None
-    loss_mask = torch.ones((1, 100000)).cuda()
+    loss_mask = torch.ones((1, 1)).cuda()
     return output_tensor, partial(loss_func, loss_mask, model=model)
 
 def train_valid_test_datasets_provider(train_val_test_num_samples):
@@ -525,7 +525,6 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
         def worker_init_fn(_seed):
             _seed = _seed * 256
             def _worker_init_fn(worker_id):
-                print(f"worker_init_fn with {_seed + worker_id}")
                 np.random.seed(_seed + worker_id)
                 random.seed(_seed + worker_id)
             return _worker_init_fn
@@ -536,12 +535,18 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
         args.train_data_meta="/root/add_dit/test_data/test.json"
         args.train_data_dir="/root/add_dit/test_data"
         args.video_sample_size=960
+        args.token_sample_size=512
         args.video_sample_stride=2
         args.video_sample_n_frames=81
         args.video_repeat=1
         args.image_sample_size=1024
-        args.enable_bucket=False
+        args.enable_bucket=True
         args.seed = 22
+        args.random_hw_adapt = True
+        args.training_with_video_token_length = True
+        args.train_mode="inpaint" 
+        args.random_ratio_crop = False
+        args.enable_text_encoder_in_dataloader = False
         
         train_dataset = ImageVideoDataset(
             args.train_data_meta, args.train_data_dir,
@@ -554,16 +559,232 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
         batch_sampler_generator = torch.Generator().manual_seed(args.seed)
         dp_size = parallel_state.get_data_parallel_world_size()
         mini_batch_size = args.micro_batch_size * dp_size
-        batch_sampler = ImageVideoSampler(RandomSampler(train_dataset, generator=batch_sampler_generator), train_dataset, mini_batch_size)
+        # batch_sampler = ImageVideoSampler(RandomSampler(train_dataset, generator=batch_sampler_generator), train_dataset, mini_batch_size)
+        # train_dataloader = torch.utils.data.DataLoader(
+        #     train_dataset,
+        #     batch_sampler=batch_sampler, 
+        #     persistent_workers=False,
+        #     num_workers=0,
+        #     # persistent_workers=True if args.dataloader_num_workers != 0 else False,
+        #     # num_workers=args.dataloader_num_workers,
+        #     worker_init_fn=worker_init_fn(args.seed)
+        # )
+
+
+        aspect_ratio_sample_size = {key : [x / 512 * args.video_sample_size for x in ASPECT_RATIO_512[key]] for key in ASPECT_RATIO_512.keys()}
+        batch_sampler_generator = torch.Generator().manual_seed(args.seed)
+        batch_sampler = AspectRatioBatchImageVideoSampler(
+            sampler=RandomSampler(train_dataset, generator=batch_sampler_generator), dataset=train_dataset.dataset, 
+            batch_size=mini_batch_size, train_folder = args.train_data_dir, drop_last=True,
+            aspect_ratios=aspect_ratio_sample_size,
+        )
+
+        sample_n_frames_bucket_interval = vae_model.vae.config.temporal_compression_ratio
+
+
+
+        def collate_fn(examples):
+            def get_length_to_frame_num(token_length):
+                if args.image_sample_size > args.video_sample_size:
+                    sample_sizes = list(range(args.video_sample_size, args.image_sample_size + 1, 128))
+
+                    if sample_sizes[-1] != args.image_sample_size:
+                        sample_sizes.append(args.image_sample_size)
+                else:
+                    sample_sizes = [args.image_sample_size]
+                
+                length_to_frame_num = {
+                    sample_size: min(token_length / sample_size / sample_size, args.video_sample_n_frames) // sample_n_frames_bucket_interval * sample_n_frames_bucket_interval + 1 for sample_size in sample_sizes
+                }
+
+
+                return length_to_frame_num
+
+            def get_random_downsample_ratio(sample_size, image_ratio=[],
+                                            all_choices=False, rng=None):
+                def _create_special_list(length):
+                    if length == 1:
+                        return [1.0]
+                    if length >= 2:
+                        first_element = 0.90
+                        remaining_sum = 1.0 - first_element
+                        other_elements_value = remaining_sum / (length - 1)
+                        special_list = [first_element] + [other_elements_value] * (length - 1)
+                        return special_list
+                        
+                if sample_size >= 1536:
+                    number_list = [1, 1.25, 1.5, 2, 2.5, 3] + image_ratio 
+                elif sample_size >= 1024:
+                    number_list = [1, 1.25, 1.5, 2] + image_ratio
+                elif sample_size >= 768:
+                    number_list = [1, 1.25, 1.5] + image_ratio
+                elif sample_size >= 512:
+                    number_list = [1] + image_ratio
+                else:
+                    number_list = [1]
+
+                if all_choices:
+                    return number_list
+
+                number_list_prob = np.array(_create_special_list(len(number_list)))
+                if rng is None:
+                    return np.random.choice(number_list, p = number_list_prob)
+                else:
+                    return rng.choice(number_list, p = number_list_prob)
+
+            # Get token length
+            target_token_length = args.video_sample_n_frames * args.token_sample_size * args.token_sample_size
+            length_to_frame_num = get_length_to_frame_num(target_token_length)
+
+            # Create new output
+            new_examples                 = {}
+            new_examples["target_token_length"] = target_token_length
+            new_examples["pixel_values"] = []
+            new_examples["text"]         = []
+            # Used in Inpaint mode 
+            if args.train_mode != "normal":
+                new_examples["mask_pixel_values"] = []
+                new_examples["mask"] = []
+                new_examples["clip_pixel_values"] = []
+
+            # Get downsample ratio in image and videos
+            pixel_value     = examples[0]["pixel_values"]
+            data_type       = examples[0]["data_type"]
+            f, h, w, c      = np.shape(pixel_value)
+            if data_type == 'image':
+                random_downsample_ratio = 1 if not args.random_hw_adapt else get_random_downsample_ratio(args.image_sample_size, image_ratio=[args.image_sample_size / args.video_sample_size])
+
+                aspect_ratio_sample_size = {key : [x / 512 * args.image_sample_size / random_downsample_ratio for x in ASPECT_RATIO_512[key]] for key in ASPECT_RATIO_512.keys()}
+                aspect_ratio_random_crop_sample_size = {key : [x / 512 * args.image_sample_size / random_downsample_ratio for x in ASPECT_RATIO_RANDOM_CROP_512[key]] for key in ASPECT_RATIO_RANDOM_CROP_512.keys()}
+                
+                batch_video_length = args.video_sample_n_frames + sample_n_frames_bucket_interval
+            else:
+                if args.random_hw_adapt:
+                    if args.training_with_video_token_length:
+                        local_min_size = np.min(np.array([np.mean(np.array([np.shape(example["pixel_values"])[1], np.shape(example["pixel_values"])[2]])) for example in examples]))
+                        # The video will be resized to a lower resolution than its own.
+                        choice_list = [length for length in list(length_to_frame_num.keys()) if length < local_min_size * 1.25]
+                        if len(choice_list) == 0:
+                            choice_list = list(length_to_frame_num.keys())
+                        local_video_sample_size = np.random.choice(choice_list)
+                        batch_video_length = length_to_frame_num[local_video_sample_size]
+                        random_downsample_ratio = args.video_sample_size / local_video_sample_size
+                    else:
+                        random_downsample_ratio = get_random_downsample_ratio(args.video_sample_size)
+                        batch_video_length = args.video_sample_n_frames + sample_n_frames_bucket_interval
+                else:
+                    random_downsample_ratio = 1
+                    batch_video_length = args.video_sample_n_frames + sample_n_frames_bucket_interval
+
+                aspect_ratio_sample_size = {key : [x / 512 * args.video_sample_size / random_downsample_ratio for x in ASPECT_RATIO_512[key]] for key in ASPECT_RATIO_512.keys()}
+                aspect_ratio_random_crop_sample_size = {key : [x / 512 * args.video_sample_size / random_downsample_ratio for x in ASPECT_RATIO_RANDOM_CROP_512[key]] for key in ASPECT_RATIO_RANDOM_CROP_512.keys()}
+
+            closest_size, closest_ratio = get_closest_ratio(h, w, ratios=aspect_ratio_sample_size)
+            closest_size = [int(x / 16) * 16 for x in closest_size]
+            if args.random_ratio_crop:
+                random_sample_size = aspect_ratio_random_crop_sample_size[
+                    np.random.choice(list(aspect_ratio_random_crop_sample_size.keys()), p = ASPECT_RATIO_RANDOM_CROP_PROB)
+                ]
+                random_sample_size = [int(x / 16) * 16 for x in random_sample_size]
+
+            for example in examples:
+                if args.random_ratio_crop:
+                    # To 0~1
+                    pixel_values = torch.from_numpy(example["pixel_values"]).permute(0, 3, 1, 2).contiguous()
+                    pixel_values = pixel_values / 255.
+
+                    # Get adapt hw for resize
+                    b, c, h, w = pixel_values.size()
+                    th, tw = random_sample_size
+                    if th / tw > h / w:
+                        nh = int(th)
+                        nw = int(w / h * nh)
+                    else:
+                        nw = int(tw)
+                        nh = int(h / w * nw)
+                    
+                    transform = transforms.Compose([
+                        transforms.Resize([nh, nw]),
+                        transforms.CenterCrop([int(x) for x in random_sample_size]),
+                        transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True),
+                    ])
+                else:
+                    # To 0~1
+                    pixel_values = torch.from_numpy(example["pixel_values"]).permute(0, 3, 1, 2).contiguous()
+                    pixel_values = pixel_values / 255.
+
+                    # Get adapt hw for resize
+                    closest_size = list(map(lambda x: int(x), closest_size))
+                    if closest_size[0] / h > closest_size[1] / w:
+                        resize_size = closest_size[0], int(w * closest_size[0] / h)
+                    else:
+                        resize_size = int(h * closest_size[1] / w), closest_size[1]
+                    
+                    transform = transforms.Compose([
+                        transforms.Resize(resize_size, interpolation=transforms.InterpolationMode.BILINEAR),  # Image.BICUBIC
+                        transforms.CenterCrop(closest_size),
+                        transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True),
+                    ])
+                new_examples["pixel_values"].append(transform(pixel_values))
+                new_examples["text"].append(example["text"])
+
+                batch_video_length = int(min(batch_video_length, len(pixel_values)))
+
+                # Magvae needs the number of frames to be 4n + 1.
+                batch_video_length = (batch_video_length - 1) // sample_n_frames_bucket_interval * sample_n_frames_bucket_interval + 1
+
+                if batch_video_length <= 0:
+                    batch_video_length = 1
+
+                if args.train_mode != "normal":
+                    mask = get_random_mask(new_examples["pixel_values"][-1].size())
+                    mask_pixel_values = new_examples["pixel_values"][-1] * (1 - mask) 
+                    # Wan 2.1 use 0 for masked pixels
+                    # + torch.ones_like(new_examples["pixel_values"][-1]) * -1 * mask
+                    new_examples["mask_pixel_values"].append(mask_pixel_values)
+                    new_examples["mask"].append(mask)
+                    
+                    clip_pixel_values = new_examples["pixel_values"][-1][0].permute(1, 2, 0).contiguous()
+                    clip_pixel_values = (clip_pixel_values * 0.5 + 0.5) * 255
+                    new_examples["clip_pixel_values"].append(clip_pixel_values)
+
+            # Limit the number of frames to the same
+            new_examples["pixel_values"] = torch.stack([example[:batch_video_length] for example in new_examples["pixel_values"]])
+            if args.train_mode != "normal":
+                new_examples["mask_pixel_values"] = torch.stack([example[:batch_video_length] for example in new_examples["mask_pixel_values"]])
+                new_examples["mask"] = torch.stack([example[:batch_video_length] for example in new_examples["mask"]])
+                new_examples["clip_pixel_values"] = torch.stack([example for example in new_examples["clip_pixel_values"]])
+
+            # Encode prompts when enable_text_encoder_in_dataloader=True
+            if args.enable_text_encoder_in_dataloader:
+                prompt_ids = tokenizer(
+                    new_examples['text'], 
+                    max_length=args.tokenizer_max_length, 
+                    padding="max_length", 
+                    add_special_tokens=True, 
+                    truncation=True, 
+                    return_tensors="pt"
+                )
+                encoder_hidden_states = text_encoder(
+                    prompt_ids.input_ids
+                )[0]
+                new_examples['encoder_attention_mask'] = prompt_ids.attention_mask
+                new_examples['encoder_hidden_states'] = encoder_hidden_states
+
+            return new_examples
+        
+        # DataLoaders creation:
         train_dataloader = torch.utils.data.DataLoader(
             train_dataset,
-            batch_sampler=batch_sampler, 
-            persistent_workers=False,
-            num_workers=0,
+            batch_sampler=batch_sampler,
+            collate_fn=collate_fn,
             # persistent_workers=True if args.dataloader_num_workers != 0 else False,
             # num_workers=args.dataloader_num_workers,
+            # worker_init_fn=worker_init_fn(args.seed + accelerator.process_index)
             worker_init_fn=worker_init_fn(args.seed)
         )
+
+
 
         return train_dataloader, train_dataloader, train_dataloader
     else:

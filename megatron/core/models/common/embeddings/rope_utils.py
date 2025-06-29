@@ -306,6 +306,7 @@ def rope_apply(x, grid_sizes, freqs):
     # split freqs
     freqs = freqs.split([c - 2 * (c // 3), c // 3, c // 3], dim=1)
 
+    grid_sizes = grid_sizes.to(torch.int64)
     # loop over samples
     output = []
     for i, (f, h, w) in enumerate(grid_sizes.tolist()):

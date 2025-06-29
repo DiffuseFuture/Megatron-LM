@@ -47,21 +47,19 @@ def resize_mask(mask, latent, process_first_frame_only=True):
     return resized_mask
 
 
-def get_timesteps_and_sigmas(noise_scheduler, latents, n_dim=4, dtype=torch.float32):
+def get_timesteps_and_sigmas(noise_scheduler, bs, n_dim=4, dtype=torch.float32):
     args = get_args()
     args.train_sampling_steps = 1000
     idx_sampling = DiscreteSampling(args.train_sampling_steps, uniform_sampling=True)
-    indices = idx_sampling(latents.size(0), generator=None, device=latents.device)
+    indices = idx_sampling(bs, generator=None).cuda()
     indices = indices.long().cpu()
-    timesteps = noise_scheduler.timesteps[indices].to(device=latents.device)
-    sigmas = noise_scheduler.sigmas.to(device=latents.device, dtype=dtype)
-    schedule_timesteps = noise_scheduler.timesteps.to(latents.device)
-    timesteps = timesteps.to(latents.device)
+    timesteps = noise_scheduler.timesteps[indices].cuda()
+    sigmas = noise_scheduler.sigmas.to(dtype=dtype).cuda()
+    schedule_timesteps = noise_scheduler.timesteps.cuda()
+    timesteps = timesteps.cuda()
     step_indices = [(schedule_timesteps == t).nonzero().item() for t in timesteps]
 
     sigma = sigmas[step_indices].flatten()
     while len(sigma.shape) < n_dim:
         sigma = sigma.unsqueeze(-1)
-    print("sigma", sigma.shape)
-    print("sigma", sigma)
     return timesteps, sigma

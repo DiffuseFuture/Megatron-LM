@@ -285,6 +285,7 @@ class WanTransformer3DModel(LanguageModule):
 
         c = self.out_dim
         out = []
+        grid_sizes = grid_sizes.to(torch.int64)
         for u, v in zip(x, grid_sizes.tolist()):
             u = u[:math.prod(v)].view(*v, *self.patch_size, c)
             u = torch.einsum('fhwpqrc->cfphqwr', u)
@@ -354,8 +355,7 @@ class WanTransformer3DModel(LanguageModule):
             
             x = x.transpose(0, 1).contiguous()
             context = context.transpose(0, 1).contiguous()
-            print("xxx shape", x.shape)
-            print("context shape", context.shape)
+        
 
             
 
@@ -379,7 +379,7 @@ class WanTransformer3DModel(LanguageModule):
         # # print("context_mask shape:", context_mask.shape if context_mask is not None else None)
         # print("grid_sizes:", grid_sizes)
 
-        x, grid_sizes = self.decoder(
+        x, grid_sizes, target = self.decoder(
             hidden_states=x,
             e = e0,
             attention_mask=attention_mask,
@@ -389,6 +389,7 @@ class WanTransformer3DModel(LanguageModule):
             context=context,
             context_mask=context_mask,
             grid_sizes=grid_sizes,
+            target=target,
             packed_seq_params=packed_seq_params,
         )
 
@@ -398,63 +399,12 @@ class WanTransformer3DModel(LanguageModule):
             x = x.transpose(0, 1).contiguous()
             x = self.unpatchify(x, grid_sizes)
             x = x = torch.stack(x)
-            return x
+            return x, target
         else:
-            # max_seqlen = 100000
-            # seq_len = x.size(1)
-            # assert max_seqlen >= seq_len
-            # # x_100000 = 
-            # x_shape = x.shape
-            # context_shape = context.shape
-            # target_shape = target.shape
-            # grid_sizes_shape = grid_sizes.shape
-            # x_padding_zero = torch.cat([x, torch.zeros((x.size(0), max_seqlen - seq_len, x.size(1)), device=x.device)], dim = 1)
-            # x_padding_zero_flattn = x_padding_zero.reshape(-1)
-            # context_flattn = 
-            
-            # print("xxx shape", x.shape)
-            # print("context shape", context.shape)
-            # print("target shape", target.shape)
-            # print("grid_sizes", grid_sizes)
-            # x = torch.cat([x, context], dim = 1)
-            max_seqlen = 100000
-            seq_len = x.size(0)
-            assert max_seqlen >= seq_len
-            
-            # 保存各个张量的原始形状
-            x_shape = torch.tensor(x.shape, device=x.device)
-            context_shape = torch.tensor(context.shape, device=x.device)
-            target_shape = torch.tensor(target.shape, device=x.device)
-            grid_sizes_shape = torch.tensor(grid_sizes.shape, device=x.device)
+            grid_sizes = grid_sizes.reshape(1, grid_sizes.size(0), grid_sizes.size(1))
+            target = target.reshape(target.size(0), target.size(1), -1)
+            return [x, context, target, grid_sizes]
 
-            print("x_shape", x_shape)
-            print("context_shape", context_shape)
-            print("target_shape", target_shape)
-            print("grid_sizes_shape", grid_sizes_shape)
-            
-            # 补全 x 到 max_seqlen（第二维）
-            padding_len = max_seqlen - seq_len
-            x_padded = torch.cat([x, torch.zeros((padding_len, x.size(1), x.size(2)), device=x.device)], dim=0)
-            x_1d = x_padded.reshape(-1)
-            
-            # # 其他张量 flatten 成一维
-            context_1d = context.reshape(-1)
-            target_1d = target.reshape(-1)
-            
-            grid_sizes_1d = grid_sizes.reshape(-1)
-
-            final_tensor = torch.cat([
-                x_shape.to(torch.float16), x_1d.to(torch.float16),
-                context_shape.to(torch.float16), context_1d.to(torch.float16),
-                target_shape.to(torch.float16), target_1d.to(torch.float16),
-                grid_sizes_shape.to(torch.float16), grid_sizes_1d.to(torch.float16)
-            ])
-            print("final_tensor shape", final_tensor.shape)
-            print("final_tensor", final_tensor[0])
-            print("final_tensor", final_tensor.dtype)
-            return final_tensor
-            
-            # return [x_shape, x_padded, context, target_shape, target, grid_sizes]
             
 
 

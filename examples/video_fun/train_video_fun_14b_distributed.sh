@@ -4,12 +4,13 @@
 
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export PYTHONPATH=/root/add_dit/
-export CUDA_LAUNCH_BLOCKING=1
-export NVTE_DEBUG=1
-export NVTE_DEBUG_LEVEL=2
+export NCCL_DEBUG=WARN
+# export CUDA_LAUNCH_BLOCKING=1
+# export NVTE_DEBUG=1
+# export NVTE_DEBUG_LEVEL=2
 # export NVTE_FUSED_ATTN=cd
 
-GPUS_PER_NODE=2
+GPUS_PER_NODE=8
 # Change for multinode config
 MASTER_ADDR=localhost
 MASTER_PORT=6000
@@ -49,7 +50,7 @@ GPT_MODEL_ARGS=(
 
 TRAINING_ARGS=(
     --micro-batch-size 1
-    --global-batch-size 1
+    --global-batch-size 16
     --train-iters 1
     --weight-decay 0.1 
     --adam-beta1 0.9 
@@ -70,13 +71,14 @@ TRAINING_ARGS=(
 MODEL_PARALLEL_ARGS=(
         # --tensor-model-parallel-size 8
         # --pipeline-model-parallel-size 16
-        --tensor-model-parallel-size 1
+        --tensor-model-parallel-size 4
         --pipeline-model-parallel-size 2
         # --transformer-impl local
 )
 
 DATA_ARGS=(
     --data-path $DATA_PATH
+    # --dataloader-type cyclic
     --vocab-file $VOCAB_FILE
     --merge-file $MERGE_FILE
     --split 949,50,1
