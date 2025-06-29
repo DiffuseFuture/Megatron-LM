@@ -66,6 +66,7 @@ TRAINING_ARGS=(
     --no-persist-layer-norm
     --no-gradient-accumulation-fusion
     --untie-embeddings-and-output-weights
+    --moe-token-dispatcher-type "alltoall"
 )
 
 MODEL_PARALLEL_ARGS=(
@@ -82,6 +83,10 @@ DATA_ARGS=(
     --vocab-file $VOCAB_FILE
     --merge-file $MERGE_FILE
     --split 949,50,1
+    --enable_bucket
+    --training_with_video_token_length
+    --random_hw_adapt
+    --variable_seq_lengths
 )
 
 EVAL_AND_LOGGING_ARGS=(

@@ -70,6 +70,7 @@ def add_megatron_arguments(parser: argparse.ArgumentParser):
     parser = _add_config_logger_args(parser)
     parser = _add_rerun_machine_args(parser)
     parser = _add_msc_args(parser)
+    parser = _add_wan_args(parser)
 
     return parser
 
@@ -661,7 +662,7 @@ def validate_args(args, defaults={}):
     # across batches/microbatches. Due to additional communication overhead
     # during pipeline parallelism, it should not be set if sequence length
     # is constant during training.
-    args.variable_seq_lengths = False
+    # args.variable_seq_lengths = False
 
     # Iteration-based training.
     if args.train_iters:
@@ -2918,4 +2919,45 @@ def _add_msc_args(parser):
     group = parser.add_argument_group(title="msc")
     group.add_argument('--disable-msc', default=True, action='store_false', dest='enable_msc',
                        help='Disable the usage of Multi-Storage Client (MSC) in Megatron Core.')
+    return parser
+
+def _add_wan_args(parser):
+    group = parser.add_argument_group(title='WAN Parameters')
+
+    group.add_argument('--train_data_meta', type=str, default="/root/add_dit/test_data/test.json",
+                       help='Path to the metadata for the training data.')
+    group.add_argument('--train_data_dir', type=str, default="/root/add_dit/test_data",
+                       help='Directory containing the training data.')
+    group.add_argument('--video_sample_size', type=int, default=960,
+                       help='Size of video samples.')
+    group.add_argument('--token_sample_size', type=int, default=512,
+                       help='Size of token samples.')
+    group.add_argument('--video_sample_stride', type=int, default=2,
+                       help='Stride for sampling video frames.')
+    group.add_argument('--video_sample_n_frames', type=int, default=81,
+                       help='Number of frames to sample from the video.')
+    group.add_argument('--video_repeat', type=int, default=1,
+                       help='Repeat factor for video samples.')
+    group.add_argument('--image_sample_size', type=int, default=1024,
+                       help='Size of image samples.')
+    group.add_argument('--enable_bucket', action='store_true',
+                       help='Enable bucket batching for variable sequence lengths.')
+    group.add_argument('--random_hw_adapt', action='store_true',
+                       help='Enable random hardware adaptation during training.')
+    group.add_argument('--training_with_video_token_length', action='store_true',
+                       help='Enable training with video token length.')
+    group.add_argument('--train_mode', type=str, default="inpaint",
+                       help='Training mode, such as inpaint or other.')
+    group.add_argument('--random_ratio_crop', action='store_true',
+                       help='Disable random ratio cropping.')
+    group.add_argument('--enable_text_encoder_in_dataloader', action='store_true',
+                       help='Disable the text encoder in the data loader.')
+    group.add_argument('--variable_seq_lengths', action='store_true',
+                       help='Enable variable sequence lengths for the input data.')
+    group.add_argument('--pretrained_model_path', type=str, default="/root/add_dit/models/alibaba-pai/Wan2.1-Fun-V1.1-1.3B-InP",
+                       help='Path to the pretrained model for fine-tuning or loading.')
+    group.add_argument('--wan_civitai_path', type=str, default="wan_civitai.yaml",
+                       help='Path to the WAN Civitai model or resources.')
+    group.add_argument('--tokenizer_max_length', type=int, default=512,
+                       help='Maximum length of tokens for the tokenizer.')
     return parser

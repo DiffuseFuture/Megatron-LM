@@ -95,8 +95,27 @@ clip_model = None
 sigmas = None
 
 
+def modify_t5_config(t5_config, wan_config):
+    for field, value in vars(t5_config).items():
+        print(f"{field}: {value}")
+
+    text_encoder_subpath: models_t5_umt5-xxl-enc-bf16.pth
+    tokenizer_subpath: google/umt5-xxl
+    text_length: 512
+    vocab: 256384
+    num_buckets: 32
+    shared_pos: False
 
 
+    t5_config.num_layers = wan_config['text_encoder_kwargs'].get('num_layers')
+    t5_config.hidden_size = wan_config['text_encoder_kwargs'].get('dim')
+    t5_config.num_attention_heads = wan_config['text_encoder_kwargs'].get('num_heads')
+    t5_config.ffn_hidden_size = wan_config['text_encoder_kwargs'].get('dim_ffn')
+    t5_config.hidden_dropout = wan_config['text_encoder_kwargs'].get('dropout')
+    t5_config.attention_dropout = wan_config['text_encoder_kwargs'].get('dropout')
+    t5_config.kv_channels =  wan_config['text_encoder_kwargs'].get('dim_attn') // wan_config['text_encoder_kwargs'].get('num_heads')
+
+    return t5_config
 
 def model_provider(
     pre_process=True, post_process=True, vp_stage: Optional[int] = None
@@ -114,9 +133,7 @@ def model_provider(
         Union[GPTModel, megatron.legacy.model.GPTModel]: The returned model
     """
     args = get_args()
-    args.variable_seq_lengths = True
-    args.moe_token_dispatcher_type = "alltoall"
-    wan_config = OmegaConf.load("wan_civitai.yaml")
+    wan_config = OmegaConf.load(args.wan_civitai_path)
 
     if has_nvidia_modelopt and modelopt_args_enabled(args):  # [ModelOpt]
         return model_provider_modelopt(pre_process, post_process)
@@ -153,22 +170,24 @@ def model_provider(
         global t5_model, tokenizer, vae_model, clip_model
         
         tokenizer = AutoTokenizer.from_pretrained(
-            os.path.join("/root/add_dit/models/alibaba-pai/Wan2.1-Fun-V1.1-1.3B-InP", 
+            os.path.join(args.pretrained_model_path, 
             wan_config['text_encoder_kwargs'].get('tokenizer_subpath', 'tokenizer')),
         )
         
         
         t5_config = copy.deepcopy(config)
-        encoder_config = copy.deepcopy(config)
+        t5_config = modify_t5_config(t5_config, wan_config)
 
         en_block_spec = get_t5_encoder_with_transformer_engine_block_spec(
-            config.num_layers
+            t5_config.num_layers
         )
 
-        
+        print("args.padded_vocab_size", args.padded_vocab_size)
+        print("args.max_position_embeddings", args.max_position_embeddings)
+
         t5_model = T5Model(
             config=t5_config,
-            encoder_config=encoder_config,
+            encoder_config=t5_config,
             transformer_encoder_layer_spec=en_block_spec,
             transformer_decoder_layer_spec=None,
             vocab_size=args.padded_vocab_size,
@@ -192,8 +211,8 @@ def model_provider(
         # init vae
         vae_config = copy.deepcopy(config)
         
-        pretrained_model_path = "/root/add_dit/models/alibaba-pai/Wan2.1-Fun-V1.1-1.3B-InP/Wan2.1_VAE.pth" 
-        vae_model = WanVae(config, pretrained_model_path).to(torch.float16).cuda(torch.cuda.current_device())
+        vae_model_path = args.pretrained_model_path + "/Wan2.1_VAE.pth"
+        vae_model = WanVae(config, vae_model_path).to(torch.float16).cuda(torch.cuda.current_device())
         vae_model.requires_grad_(False)
         # init clip
         clip_config = copy.deepcopy(config)
@@ -215,6 +234,7 @@ def model_provider(
     transformer_layer_spec = get_transformer3d_transformer_engine_block_spec()
 
     global dit_model
+    config.text_dim = wan_config['text_encoder_kwargs'].get('dim')
     dit_model = WanTransformer3DModel(
         config=config,
         transformer_layer_spec=transformer_layer_spec,
@@ -425,8 +445,6 @@ def forward_step(data_iterator, model: WanTransformer3DModel):
             seq_lens = prompt_attention_mask.gt(0).sum(dim=1).long()
     
             b, s = prompt_attention_mask.size(0), prompt_attention_mask.size(1)
-            # mask = torch.zeros((b, 1, s, s), device=latents.device, dtype = torch.bool)
-            # print("prompt_attention_mask shape", prompt_attention_mask.shape)
 
             context = t5_model(text_input_ids.cuda(), None, prompt_attention_mask, None, None)
             context = context.transpose(0, 1).contiguous()
@@ -454,6 +472,7 @@ def forward_step(data_iterator, model: WanTransformer3DModel):
             context_mask = (q_mask, kv_mask, kv_mask_img)
             attn_mask = None
 
+
         else:
             noisy_latents = None
             context = None
@@ -470,45 +489,7 @@ def forward_step(data_iterator, model: WanTransformer3DModel):
         
         output_tensor = model(noisy_latents, timestep, context, context_mask, hidden_state_seq_len, 
                                 context_seqlen, grid_sizes, attn_mask, clip_fea, inpaint_latents, target)
-            
-    
 
-    
-        # if(tokens is not None):
-        #     device = tokens.device
-        #     x = torch.randn(1, 16, 6, 90, 156, device=device, dtype=torch.float16)
-        #     t = torch.tensor([0], device=device)  # 假设 t 是时间步长标记之类的
-        #     context = [torch.randn(209, 512, device=device, dtype=torch.float16)]
-        #     # context_mask =  torch.tril(torch.ones((1, 1, 21060, 209), device=context_ids.device, dtype=torch.bool))
-        #     seqlen = 21060  # 这是个整数，不用放 device 上
-        #     y = torch.randn(1, 20, 6, 90, 156, device=device, dtype=torch.float16)
-        #     clip_fea = torch.randn(1, 257, 1280, device=device, dtype=torch.float16)
-        # else:
-        #     x = None
-        #     t = torch.tensor([0]).cuda()  # 假设 t 是时间步长标记之类的
-        #     context = None
-        #     seqlen = None
-        #     clip_fea = None
-        #     y = None
-        # if parallel_state.is_pipeline_first_stage():
-        #     context_ids = torch.ones((1, 209), dtype=torch.int64).cuda()
-        #     causal_mask = torch.tril(torch.ones((1, 209, 209), device=context_ids.device, dtype=torch.bool))
-        #     t5_model.eval()
-        #     context = t5_model(context_ids, None, causal_mask, None, None)
-        #     context = context.transpose(0, 1).contiguous()
-        #     context = [c for c in context]
-        # q_mask = torch.zeros((1, 1, 1, 21060), dtype=torch.bool).cuda()
-        # kv_mask = torch.zeros((1, 1, 1, 512), dtype=torch.bool).cuda()
-        # kv_mask_img = torch.zeros((1, 1, 1, 257), dtype=torch.bool).cuda()
-        # context_mask = (q_mask, kv_mask, kv_mask_img)
-        # hidden_state_seq_len = 21060
-        # context_seqlen = 769
-
-        # grid_sizes = torch.tensor([[ 6, 45, 78]], dtype=torch.int32).cuda()
-        # output_tensor = model(x, t, context, context_mask, hidden_state_seq_len, context_seqlen, grid_sizes, None, clip_fea, y)
-
-    # [ModelOpt]: model is needed to access ModelOpt distillation losses
-    # loss_mask = None
     loss_mask = torch.ones((1, 1)).cuda()
     return output_tensor, partial(loss_func, loss_mask, model=model)
 
@@ -518,7 +499,6 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
     Args:
         train_val_test_num_samples : A list containing the number of samples in train test and validation.
     """
-
 
     if parallel_state.is_pipeline_first_stage():
 
@@ -531,22 +511,6 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
     
         
         args = get_args()
-    
-        args.train_data_meta="/root/add_dit/test_data/test.json"
-        args.train_data_dir="/root/add_dit/test_data"
-        args.video_sample_size=960
-        args.token_sample_size=512
-        args.video_sample_stride=2
-        args.video_sample_n_frames=81
-        args.video_repeat=1
-        args.image_sample_size=1024
-        args.enable_bucket=True
-        args.seed = 22
-        args.random_hw_adapt = True
-        args.training_with_video_token_length = True
-        args.train_mode="inpaint" 
-        args.random_ratio_crop = False
-        args.enable_text_encoder_in_dataloader = False
         
         train_dataset = ImageVideoDataset(
             args.train_data_meta, args.train_data_dir,

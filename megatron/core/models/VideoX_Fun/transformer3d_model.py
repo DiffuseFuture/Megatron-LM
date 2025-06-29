@@ -187,6 +187,7 @@ class WanTransformer3DModel(LanguageModule):
         self.cross_attn_norm = config.cross_attn_norm
         self.hidden_size = config.hidden_size
         self.num_attention_heads = config.num_attention_heads
+        self.text_dim = config.text_dim
 
 
         self.transformer_layer_spec: ModuleSpec = transformer_layer_spec
@@ -203,7 +204,7 @@ class WanTransformer3DModel(LanguageModule):
         self.patch_embedding = nn.Conv3d(
             self.in_dim, self.hidden_size, kernel_size=self.patch_size, stride=self.patch_size)
         self.text_embedding = nn.Sequential(
-            nn.Linear(self.hidden_size, self.hidden_size), nn.GELU(approximate='tanh'),
+            nn.Linear(self.text_dim, self.hidden_size), nn.GELU(approximate='tanh'),
             nn.Linear(self.hidden_size, self.hidden_size))
         
         self.time_embedding = nn.Sequential(
@@ -341,6 +342,7 @@ class WanTransformer3DModel(LanguageModule):
             ])
             
             context_lens = None
+            print("context[0]", context[0].shape)
             context = self.text_embedding(
                 torch.stack([
                     torch.cat(
@@ -368,17 +370,8 @@ class WanTransformer3DModel(LanguageModule):
             device = e.device
             assert device.type == 'cuda', f"Expected CUDA device, got {device}"
             self.freqs = self.freqs.cuda()
-    
-        # print("x shape:", x.shape)
-        # print("e0 shape:", e0.shape)
-        # print("attention_mask shape:", attention_mask.shape if attention_mask is not None else None)
-        # print("seq_len:", seq_len)
-        # print("context_seqlen:", context_seqlen)
-        # print("self.freqs shape:", self.freqs.shape if hasattr(self, 'freqs') else None)
-        # print("context shape:", context.shape if context is not None else None)
-        # # print("context_mask shape:", context_mask.shape if context_mask is not None else None)
-        # print("grid_sizes:", grid_sizes)
 
+        print("start fwd")
         x, grid_sizes, target = self.decoder(
             hidden_states=x,
             e = e0,
