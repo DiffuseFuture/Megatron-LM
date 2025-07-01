@@ -23,7 +23,7 @@ def test_vae():
     initialize_distributed()
     model_parallel_cuda_manual_seed(42)
     config = TransformerConfig(num_layers=1, hidden_size=1, num_attention_heads=1)
-    pretrained_model_path = "/jizhicfs/marvinhjia/MLSys/wan/Wan2.1-Fun-V1.1-1.3B-InP/Wan2.1_VAE.pth"  # Update with actual path if needed
+    pretrained_model_path = "/nas/njw1123/Wan2.1_VAE.pth"  # Update with actual path if needed
     vae_model = WanVae(config = config, pretrained_model_path=pretrained_model_path).to(weight_dtype)
     vae_model.requires_grad_(False)
     device = torch.device("cuda")

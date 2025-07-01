@@ -8,7 +8,6 @@ from torch import Tensor
 import torch.nn as nn
 import torch.cuda.amp as amp
 import math
-
 from megatron.core import parallel_state
 from megatron.core import tensor_parallel
 from megatron.core.config_logger import has_config_logger_enabled, log_config_to_disk
@@ -293,7 +292,16 @@ class WanTransformer3DModel(LanguageModule):
             out.append(u)
         return out
 
-    
+    def split_cp(self, x):
+        cp_size = parallel_state.get_context_parallel_world_size()
+        cp_rank = parallel_state.get_context_parallel_rank()
+        seq_len = x.size(0)
+        assert seq_len % cp_size == 0
+        intervel = seq_len // cp_size
+        x = x[(cp_rank * intervel) : (cp_rank + 1) * intervel, :, :]
+        # x = x[:, (cp_rank * intervel) : (cp_rank + 1) * intervel, :]
+        return x
+
     def forward(
         self,
         x: Tensor,
@@ -341,7 +349,6 @@ class WanTransformer3DModel(LanguageModule):
             ])
             
             context_lens = None
-            print("context[0]", context[0].shape)
             context = self.text_embedding(
                 torch.stack([
                     torch.cat(
@@ -356,6 +363,8 @@ class WanTransformer3DModel(LanguageModule):
             
             x = x.transpose(0, 1).contiguous()
             context = context.transpose(0, 1).contiguous()
+
+            x = self.split_cp(x)
         
 
             
@@ -370,7 +379,6 @@ class WanTransformer3DModel(LanguageModule):
             assert device.type == 'cuda', f"Expected CUDA device, got {device}"
             self.freqs = self.freqs.cuda()
 
-        print("start fwd")
         x, grid_sizes, target = self.decoder(
             hidden_states=x,
             e = e0,
@@ -389,12 +397,12 @@ class WanTransformer3DModel(LanguageModule):
         if parallel_state.is_pipeline_last_stage():
             x = self.head(x, e)
             x = x.transpose(0, 1).contiguous()
-            x = self.unpatchify(x, grid_sizes)
-            x = x = torch.stack(x)
+            # x = self.unpatchify(x, grid_sizes)
+            # x = x = torch.stack(x)
             return x, target
         else:
             grid_sizes = grid_sizes.reshape(1, grid_sizes.size(0), grid_sizes.size(1))
-            target = target.reshape(target.size(0), target.size(1), -1)
+            # target = target.reshape(target.size(0), target.size(1), -1)
             return [x, context, target, grid_sizes]
 
             

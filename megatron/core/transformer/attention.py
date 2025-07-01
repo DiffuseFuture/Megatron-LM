@@ -167,6 +167,10 @@ class Attention(MegatronModule, ABC):
         self.key_hidden_size = self.hidden_size_per_attention_head
         self.val_hidden_size = self.hidden_size_per_attention_head
 
+        old_context_parallel_size = self.config.context_parallel_size
+        if self.attention_type == "cross":
+            self.config.context_parallel_size = 1
+
         self.core_attention = build_module(
             submodules.core_attention,
             config=self.config,
@@ -177,6 +181,8 @@ class Attention(MegatronModule, ABC):
             softmax_scale=self.config.softmax_scale,
             model_comm_pgs=self.model_comm_pgs,
         )
+        if self.attention_type == "cross":
+            self.config.context_parallel_size = old_context_parallel_size
 
         self.checkpoint_core_attention = (
             self.config.recompute_granularity == 'selective'
@@ -1333,6 +1339,9 @@ class WanSelfAttention(Attention):
             # key = key.reshape(-1, key.size(2), key.size(3))  # → [75600, 8, 64]
             # value = value.reshape(-1, value.size(2), value.size(3))  # → [75600, 8, 64]
             # print("attention_mask shape", attention_mask.shape)
+            # print("query shape", query.shape)
+            # print("key shape", query.shape)
+            # print("value shape", query.shape)
             core_attn_out = self.core_attention(
                 query,
                 key,
@@ -1542,6 +1551,7 @@ class WanCrossAttention(Attention):
             )
 
             attention_mask_x = (attention_mask[0], attention_mask[1])
+            packed_seq_params
             core_attn_out = self.core_attention(
                 query,
                 key,

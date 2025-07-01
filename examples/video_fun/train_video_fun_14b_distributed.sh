@@ -81,7 +81,7 @@ DATA_ARGS=(
     --training_with_video_token_length
     --random_hw_adapt
     --variable_seq_lengths
-    --token_sample_size 960
+    --token_sample_size 512
 )
 
 EVAL_AND_LOGGING_ARGS=(

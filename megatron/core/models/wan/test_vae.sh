@@ -15,4 +15,4 @@ DISTRIBUTED_ARGS=(
     --master_port $MASTER_PORT
 )
 
-torchrun ${DISTRIBUTED_ARGS[@]} test_vae.py
+torchrun ${DISTRIBUTED_ARGS[@]} /nas/njw1123/add_dit/megatron/core/models/wan/test_vae.py

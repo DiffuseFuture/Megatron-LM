@@ -933,8 +933,8 @@ class Transformer3DBlock(MegatronModule):
             target = self.input_tensor[2]
             grid_sizes = self.input_tensor[3]
             grid_sizes = grid_sizes.reshape(grid_sizes.size(1), grid_sizes.size(2))
-            target = target.reshape(target.size(0), target.size(1), 
-                                    int(grid_sizes[0][0].item()), int(grid_sizes[0][1].item()) * 2, int(grid_sizes[0][2].item()) * 2)
+            # target = target.reshape(target.size(0), target.size(1), 
+                                    # int(grid_sizes[0][0].item()), int(grid_sizes[0][1].item()) * 2, int(grid_sizes[0][2].item()) * 2)
 
             hidden_state_seq_len = hidden_states.size(0)
             q_mask = torch.zeros((1, hidden_state_seq_len), dtype=torch.bool).cuda()

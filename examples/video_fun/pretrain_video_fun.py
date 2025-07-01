@@ -96,7 +96,55 @@ clip_model = None
 sigmas = None
 
 
+def patchify_target(
+    targets: torch.Tensor,
+    patch_size: Tuple[int, int, int],
+) -> Tuple[List[torch.Tensor], torch.Tensor]:
+    """
+    Convert a list of video tensors into patch embeddings.
 
+    Args:
+        targets (List[Tensor]): Each tensor has shape [C, F, H, W]
+        patch_size (Tuple[int, int, int]): (p_f, p_h, p_w)
+
+    Returns:
+        Tuple:
+            - List[Tensor]: Each with shape [L, C * p_f * p_h * p_w]
+            - Tensor: Grid sizes per video [B, 3] (F_p, H_p, W_p)
+    """
+    p_f, p_h, p_w = patch_size
+    patchified = []
+    grid_sizes = []
+
+    for target in targets:
+        c, f, h, w = target.shape
+
+        assert f % p_f == 0 and h % p_h == 0 and w % p_w == 0, \
+            f"target shape {target.shape} must be divisible by patch size {patch_size}"
+
+        f_p, h_p, w_p = f // p_f, h // p_h, w // p_w
+        grid_sizes.append([f_p, h_p, w_p])
+
+        # reshape + permute to collect patches
+        target = target.view(c, f_p, p_f, h_p, p_h, w_p, p_w)
+        target = target.permute(1, 3, 5, 2, 4, 6, 0)  # -> [F_p, H_p, W_p, p_f, p_h, p_w, C]
+        patches = target.reshape(f_p * h_p * w_p, c * p_f * p_h * p_w)  # [L, D]
+
+        patchified.append(patches)
+    
+    grid_sizes = torch.tensor(grid_sizes, dtype=torch.int64).cuda()
+    # patchified = torch.tensor(patchified, dtype=torch.float16).cuda()
+    patchified_batch = torch.cat(patchified, dim=0).cuda().to(torch.float16)  # shape: [48, 512]
+    patchified_batch = torch.cat([p.unsqueeze(0) for p in patchified], dim=0).cuda().to(torch.float16)  # shape: [48, 512]
+
+    cp_size = parallel_state.get_context_parallel_world_size()
+    cp_rank = parallel_state.get_context_parallel_rank()
+    seq_len = grid_sizes[0][0] * grid_sizes[0][1] * grid_sizes[0][2]
+    assert seq_len % cp_size == 0
+    interval = seq_len // cp_size
+    patchified_batch = patchified_batch[:, cp_rank * interval : (cp_rank + 1) * interval, :]
+    
+    return patchified_batch, grid_sizes
 
 def get_gpu_memory_usage(device=None):
     """
@@ -216,11 +264,8 @@ def model_provider(
     
     print_rank_0('building WanTransformer3D model ...')
     # Experimental loading arguments from yaml
-    print("args.num_query_groups", args.num_query_groups)
     config = core_transformer3d_config_from_args(args)
-    print("config.num_query_groups", config.num_query_groups)
     config = modify_transformer3d_config(config)
-    print("change config.num_query_groups", config.num_query_groups)
 
     if parallel_state.is_pipeline_first_stage():
 
@@ -510,13 +555,13 @@ def forward_step(data_iterator, model: WanTransformer3DModel):
             noisy_latents = (1.0 - sigmas) * latents + sigmas * noise
     
             target = noise - latents
+            target, grid_sizes = patchify_target(target, model.config.patch_size)
             target.requires_grad_(False)
-            
-            grid_sizes = []
-            for noisy_latent in noisy_latents:
-                grid_sizes.append([noisy_latent.size(1), noisy_latent.size(2) // 2, noisy_latent.size(3) // 2])
 
-            hidden_state_seq_len = grid_sizes[0][0] * grid_sizes[0][1] * grid_sizes[0][2] 
+            cp_size = parallel_state.get_context_parallel_world_size()
+            hidden_state_seq_len_total = grid_sizes[0][0] * grid_sizes[0][1] * grid_sizes[0][2]
+            assert hidden_state_seq_len_total % cp_size == 0
+            hidden_state_seq_len = hidden_state_seq_len_total // cp_size
             context_seqlen = seq_lens[0] + 257
             grid_sizes = torch.tensor(grid_sizes, dtype=torch.float16, requires_grad=False).cuda()
 
@@ -532,7 +577,7 @@ def forward_step(data_iterator, model: WanTransformer3DModel):
             context = None
             context_mask = None
             grid_sizes = None
-            hidden_state_seq_len = None
+            hidden_state_seq_len_total = None
             context_seqlen = None
             clip_fea = None
             timestep, sigmas = get_timesteps_and_sigmas(noise_scheduler, args.micro_batch_size, n_dim=5, dtype=weight_dtype)
@@ -570,7 +615,7 @@ def forward_step(data_iterator, model: WanTransformer3DModel):
         #     print(f"target shape: {target.shape}")
 
         
-        output_tensor = model(noisy_latents, timestep, context, context_mask, hidden_state_seq_len, 
+        output_tensor = model(noisy_latents, timestep, context, context_mask, hidden_state_seq_len_total, 
                                 context_seqlen, grid_sizes, attn_mask, clip_fea, inpaint_latents, target)
 
     loss_mask = torch.ones((1, 1)).cuda()

@@ -302,6 +302,8 @@ def apply_rotary_pos_emb_with_cos_sin(
 def rope_apply(x, grid_sizes, freqs):
 
     n, c = x.size(2), x.size(3) // 2
+    cp_size = parallel_state.get_context_parallel_world_size()
+    cp_rank = parallel_state.get_context_parallel_rank()
 
     # split freqs
     freqs = freqs.split([c - 2 * (c // 3), c // 3, c // 3], dim=1)
@@ -310,21 +312,25 @@ def rope_apply(x, grid_sizes, freqs):
     # loop over samples
     output = []
     for i, (f, h, w) in enumerate(grid_sizes.tolist()):
-        seq_len = f * h * w
+        seq_len = f * h * w 
+        assert seq_len % cp_size == 0
+        interval = seq_len // cp_size
 
         # precompute multipliers
-        x_i = torch.view_as_complex(x[: seq_len, i].to(torch.float32).reshape(
-            seq_len, n, -1, 2))
+        x_i = torch.view_as_complex(x[: interval, i].to(torch.float32).reshape(
+            interval, n, -1, 2))
         freqs_i = torch.cat([
             freqs[0][:f].view(f, 1, 1, -1).expand(f, h, w, -1),
             freqs[1][:h].view(1, h, 1, -1).expand(f, h, w, -1),
             freqs[2][:w].view(1, 1, w, -1).expand(f, h, w, -1)
         ],
                             dim=-1).reshape(seq_len, 1, -1)
+        freqs_i = freqs_i[cp_rank * interval: (cp_rank + 1) * interval]
+
 
         # apply rotary embedding
         x_i = torch.view_as_real(x_i * freqs_i).flatten(2)
-        x_i = torch.cat([x_i, x[seq_len:, i]])
+        x_i = torch.cat([x_i, x[interval:, i]])
 
         # append to collection
         output.append(x_i)
