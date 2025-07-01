@@ -222,7 +222,6 @@ class WanTransformer3DModel(LanguageModule):
         self.model_type = ModelType.encoder_or_decoder
 
         # # These 4 attributes are needed for TensorRT-LLM export.
-        self.max_position_embeddings = max_sequence_length
 
 
         head_hidden_size = self.hidden_size // self.num_attention_heads

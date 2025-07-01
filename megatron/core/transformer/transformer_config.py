@@ -1224,7 +1224,6 @@ class WanTransformerConfig(TransformerConfig):
     window_size: tuple[int, int] = (-1, -1)
     qk_norm: bool = True
     cross_attn_norm: bool = True
-    in_channels: int = 16
     add_control_adapter: bool = False
     in_dim_control_adapter: int = 24
     add_ref_conv: bool = False

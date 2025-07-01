@@ -2960,4 +2960,7 @@ def _add_wan_args(parser):
                        help='Path to the WAN Civitai model or resources.')
     group.add_argument('--tokenizer_max_length', type=int, default=512,
                        help='Maximum length of tokens for the tokenizer.')
+    group.add_argument('--transformer3d_config_path', type=str, required=True,
+                        help='Path to the WAN Civitai model or resources.')
+
     return parser

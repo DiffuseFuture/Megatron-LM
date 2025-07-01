@@ -13,6 +13,7 @@ from einops import rearrange
 import numpy as np
 from diffusers import DDIMScheduler, FlowMatchEulerDiscreteScheduler
 import torch.nn.functional as F
+import json
 
 from diffusers.training_utils import (EMAModel,
                                       compute_density_for_timestep_sampling,
@@ -95,27 +96,79 @@ clip_model = None
 sigmas = None
 
 
+
+
+def get_gpu_memory_usage(device=None):
+    """
+    返回当前设备显存的使用情况，包含已分配显存、保留显存和显存摘要。
+
+    参数:
+    - device: 要监控的 GPU 设备，默认为 None，表示使用当前设备。
+
+    返回:
+    - 返回显存使用情况的字符串。
+    """
+    if torch.cuda.is_available():
+        # 获取当前设备，如果未指定设备，则使用当前设备
+        device = device or torch.cuda.current_device()
+
+        # 获取当前 GPU 的显存使用情况
+        allocated_memory = torch.cuda.memory_allocated(device)  # 已分配显存
+        reserved_memory = torch.cuda.memory_reserved(device)  # 保留显存
+
+        # 转换为 MB
+        allocated_memory_mb = allocated_memory / (1024 ** 2)
+        reserved_memory_mb = reserved_memory / (1024 ** 2)
+
+        # 格式化显存使用情况
+        memory_info = (
+            f"Device {device} - Memory Allocated (bytes): {allocated_memory}\n"
+            f"Device {device} - Memory Reserved (bytes): {reserved_memory}\n"
+            f"Device {device} - Memory Allocated (MB): {allocated_memory_mb:.2f} MB\n"
+            f"Device {device} - Memory Reserved (MB): {reserved_memory_mb:.2f} MB\n"
+        )
+
+        # 获取显存的摘要
+        memory_summary = torch.cuda.memory_summary(device, abbreviated=True)
+        memory_info += f"Device {device} - Memory Summary: \n{memory_summary}"
+
+        return memory_info
+    else:
+        return "CUDA is not available. No GPU found."
+
 def modify_t5_config(t5_config, wan_config):
-    for field, value in vars(t5_config).items():
-        print(f"{field}: {value}")
-
-    text_encoder_subpath: models_t5_umt5-xxl-enc-bf16.pth
-    tokenizer_subpath: google/umt5-xxl
-    text_length: 512
-    vocab: 256384
-    num_buckets: 32
-    shared_pos: False
-
 
     t5_config.num_layers = wan_config['text_encoder_kwargs'].get('num_layers')
     t5_config.hidden_size = wan_config['text_encoder_kwargs'].get('dim')
     t5_config.num_attention_heads = wan_config['text_encoder_kwargs'].get('num_heads')
+    t5_config.num_query_groups = t5_config.num_attention_heads
     t5_config.ffn_hidden_size = wan_config['text_encoder_kwargs'].get('dim_ffn')
     t5_config.hidden_dropout = wan_config['text_encoder_kwargs'].get('dropout')
     t5_config.attention_dropout = wan_config['text_encoder_kwargs'].get('dropout')
     t5_config.kv_channels =  wan_config['text_encoder_kwargs'].get('dim_attn') // wan_config['text_encoder_kwargs'].get('num_heads')
+    
 
     return t5_config
+
+
+def modify_transformer3d_config(transformer3d_config):
+    args = get_args()
+    with open(args.transformer3d_config_path, 'r') as f:
+        config_json = json.load(f)
+
+    transformer3d_config.hidden_size = config_json.get('dim')
+    transformer3d_config.ffn_hidden_size = config_json.get('ffn_dim')
+    transformer3d_config.freq_dim = config_json.get('freq_dim')
+    transformer3d_config.in_dim = config_json.get('in_dim')
+    transformer3d_config.num_attention_heads = config_json.get('num_heads')
+    transformer3d_config.num_layers = config_json.get('num_layers')
+    transformer3d_config.out_dim = config_json.get('out_dim')
+    transformer3d_config.text_dim = config_json.get('text_dim')     
+    transformer3d_config.text_len = config_json.get('text_len')     
+
+    return transformer3d_config
+
+
 
 def model_provider(
     pre_process=True, post_process=True, vp_stage: Optional[int] = None
@@ -163,7 +216,11 @@ def model_provider(
     
     print_rank_0('building WanTransformer3D model ...')
     # Experimental loading arguments from yaml
+    print("args.num_query_groups", args.num_query_groups)
     config = core_transformer3d_config_from_args(args)
+    print("config.num_query_groups", config.num_query_groups)
+    config = modify_transformer3d_config(config)
+    print("change config.num_query_groups", config.num_query_groups)
 
     if parallel_state.is_pipeline_first_stage():
 
@@ -177,21 +234,18 @@ def model_provider(
         
         t5_config = copy.deepcopy(config)
         t5_config = modify_t5_config(t5_config, wan_config)
+        t5_config.context_parallel_size = 1
 
         en_block_spec = get_t5_encoder_with_transformer_engine_block_spec(
             t5_config.num_layers
         )
-
-        print("args.padded_vocab_size", args.padded_vocab_size)
-        print("args.max_position_embeddings", args.max_position_embeddings)
-
         t5_model = T5Model(
             config=t5_config,
             encoder_config=t5_config,
             transformer_encoder_layer_spec=en_block_spec,
             transformer_decoder_layer_spec=None,
             vocab_size=args.padded_vocab_size,
-            max_sequence_length=args.max_position_embeddings,
+            max_sequence_length=config.text_len,
             pre_process=pre_process,
             post_process=post_process,
             fp16_lm_cross_entropy=args.fp16_lm_cross_entropy,
@@ -210,6 +264,7 @@ def model_provider(
 
         # init vae
         vae_config = copy.deepcopy(config)
+        vae_config.context_parallel_size = 1
         
         vae_model_path = args.pretrained_model_path + "/Wan2.1_VAE.pth"
         vae_model = WanVae(config, vae_model_path).to(torch.float16).cuda(torch.cuda.current_device())
@@ -218,6 +273,8 @@ def model_provider(
         clip_config = copy.deepcopy(config)
         clip_config.hidden_size = 1280
         clip_config.num_attention_heads = 8
+        clip_config.num_query_groups= 8
+        clip_config.context_parallel_size = 1
         if args.transformer_impl == "transformer_engine":
             clip_spec = get_wan_clip_spec_te()
         else:
@@ -415,7 +472,6 @@ def forward_step(data_iterator, model: WanTransformer3DModel):
             inpaint_latents = torch.concat([mask, mask_latents], dim=1)
             inpaint_latents = t2v_flag[:, None, None, None, None] * inpaint_latents
 
-            # clip_mask = torch.zeros(1, 1, 257,257).to(torch.bool).cuda()
             clip_mask = None
             clip_context = []
             for clip_input in clip_pixel_values:
@@ -427,9 +483,7 @@ def forward_step(data_iterator, model: WanTransformer3DModel):
                 
             clip_context = torch.cat(clip_context)
     
-    
             # text
-            args.tokenizer_max_length = 512
             prompt_ids = tokenizer(
                 text, 
                 padding="max_length", 
@@ -485,7 +539,36 @@ def forward_step(data_iterator, model: WanTransformer3DModel):
             inpaint_latents = None
             target = None
             attn_mask = None
-            
+    
+        # # 检查并输出每个输入的形状，如果不是 None
+        # if noisy_latents is not None:
+        #     print(f"noisy_latents shape: {noisy_latents.shape}")
+        
+        # if timestep is not None:
+        #     print(f"timestep shape: {timestep.shape}")
+        
+        # if context is not None:
+        #     for c in context:
+        #         print(f"context shape: {c.shape}")
+        
+        # if context_mask is not None:
+        #     print(f"context_mask shape: {context_mask[0].shape, context_mask[1].shape, context_mask[2].shape}")
+        
+        # if grid_sizes is not None:
+        #     print(f"grid_sizes shape: {grid_sizes.shape}")
+        
+        # if attn_mask is not None:
+        #     print(f"attn_mask shape: {attn_mask.shape}")
+        
+        # if clip_fea is not None:
+        #     print(f"clip_fea shape: {clip_fea.shape}")
+        
+        # if inpaint_latents is not None:
+        #     print(f"inpaint_latents shape: {inpaint_latents.shape}")
+        
+        # if target is not None:
+        #     print(f"target shape: {target.shape}")
+
         
         output_tensor = model(noisy_latents, timestep, context, context_mask, hidden_state_seq_len, 
                                 context_seqlen, grid_sizes, attn_mask, clip_fea, inpaint_latents, target)
@@ -523,17 +606,6 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
         batch_sampler_generator = torch.Generator().manual_seed(args.seed)
         dp_size = parallel_state.get_data_parallel_world_size()
         mini_batch_size = args.micro_batch_size * dp_size
-        # batch_sampler = ImageVideoSampler(RandomSampler(train_dataset, generator=batch_sampler_generator), train_dataset, mini_batch_size)
-        # train_dataloader = torch.utils.data.DataLoader(
-        #     train_dataset,
-        #     batch_sampler=batch_sampler, 
-        #     persistent_workers=False,
-        #     num_workers=0,
-        #     # persistent_workers=True if args.dataloader_num_workers != 0 else False,
-        #     # num_workers=args.dataloader_num_workers,
-        #     worker_init_fn=worker_init_fn(args.seed)
-        # )
-
 
         aspect_ratio_sample_size = {key : [x / 512 * args.video_sample_size for x in ASPECT_RATIO_512[key]] for key in ASPECT_RATIO_512.keys()}
         batch_sampler_generator = torch.Generator().manual_seed(args.seed)

@@ -8,6 +8,7 @@ import numpy as np
 import torch
 from PIL import Image
 from torch.utils.data import BatchSampler, Dataset, Sampler
+from megatron.core import parallel_state
 
 ASPECT_RATIO_512 = {
     '0.25': [256.0, 1024.0], '0.26': [256.0, 992.0], '0.27': [256.0, 960.0], '0.28': [256.0, 928.0],
@@ -374,5 +375,9 @@ class AspectRatioBatchImageVideoSampler(BatchSampler):
                 bucket.append(idx)
                 # yield a batch of indices in the same aspect ratio group
                 if len(bucket) == self.batch_size:
-                    yield bucket[:]
+                    dp_size = parallel_state.get_data_parallel_world_size()
+                    dp_rank = parallel_state.get_data_parallel_rank()
+                    assert(self.batch_size % dp_size == 0)
+                    micro_batch_size = self.batch_size // dp_size
+                    yield bucket[dp_rank * micro_batch_size: (dp_rank + 1) * micro_batch_size]
                     del bucket[:]
