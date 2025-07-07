@@ -221,6 +221,7 @@ def _get_block_submodules(
             return spec.submodules
         elif issubclass(spec.module, BaseTransformerLayer):
             num_layers = get_num_layers_to_build(config, vp_stage)
+            print("num_layers", num_layers)
             return TransformerBlockSubmodules(
                 layer_specs=[spec] * num_layers, layer_norm=None
             )
@@ -883,14 +884,11 @@ class Transformer3DBlock(MegatronModule):
         self,
         hidden_states: Tensor,
         e: Tensor,
+        grid_sizes: Tensor,
         attention_mask: Tensor,
-        seq_len: int,
-        context_seqlen: int,
         freqs: Tensor,
         context: Tensor,
         context_mask: Tensor,
-        grid_sizes: Tensor,
-        target: Tensor,
         packed_seq_params: PackedSeqParams,
     ):
         """
@@ -927,14 +925,13 @@ class Transformer3DBlock(MegatronModule):
             hidden_states = hidden_states.unwrap()
 
         if not parallel_state.is_pipeline_first_stage():
+            raise NotImplementedError("don't support pp now!")
             # hidden_states, context, target, grid_sizes = self.restore_from_tensor(self.input_tensor)
             hidden_states = self.input_tensor[0]
             context = self.input_tensor[1]
             target = self.input_tensor[2]
             grid_sizes = self.input_tensor[3]
             grid_sizes = grid_sizes.reshape(grid_sizes.size(1), grid_sizes.size(2))
-            # target = target.reshape(target.size(0), target.size(1), 
-                                    # int(grid_sizes[0][0].item()), int(grid_sizes[0][1].item()) * 2, int(grid_sizes[0][2].item()) * 2)
 
             hidden_state_seq_len = hidden_states.size(0)
             q_mask = torch.zeros((1, hidden_state_seq_len), dtype=torch.bool).cuda()
@@ -975,6 +972,9 @@ class Transformer3DBlock(MegatronModule):
         use_inner_fp8_context = self.config.fp8 and self.config.fp8_recipe != Fp8Recipe.delayed
         outer_fp8_context = get_fp8_context(self.config) if use_outer_fp8_context else nullcontext()
 
+
+        # self.offload_context.
+
         with rng_context, outer_fp8_context:
             # Forward pass.
             if self.config.recompute_granularity == 'full' and self.training:
@@ -1004,7 +1004,6 @@ class Transformer3DBlock(MegatronModule):
                             freqs=freqs,
                             grid_sizes=grid_sizes,
                             packed_seq_params=packed_seq_params,
-                            # sequence_len_offset=sequence_len_offset,
                         )
 
                     if (
@@ -1024,7 +1023,7 @@ class Transformer3DBlock(MegatronModule):
                 inp=hidden_states, requires_grad=True, keep_graph=True
             )
 
-        return hidden_states, grid_sizes, target
+        return hidden_states
 
     def sharded_state_dict(
         self, prefix: str = '', sharded_offsets: tuple = (), metadata: dict = None

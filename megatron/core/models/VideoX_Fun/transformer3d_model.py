@@ -18,6 +18,7 @@ from megatron.core.models.common.embeddings.rotary_pos_embedding import (
     MultimodalRotaryEmbedding,
     RotaryEmbedding,
 )
+from diffusers.training_utils import compute_loss_weighting_for_sd3
 from megatron.core.models.common.language_module.language_module import LanguageModule
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.transformer.enums import ModelType
@@ -31,7 +32,7 @@ from megatron.core.transformer.transformer_block import TransformerBlock, Transf
 from megatron.core.transformer.transformer_config import TransformerConfig, WanTransformerConfig
 from megatron.core.utils import WrappedTensor, deprecate_inference_params
 from megatron.core.transformer.torch_norm import WanRMSNorm, WanLayerNorm
-
+import torch.nn.functional as F
 
 
 def rope_params(max_seq_len, dim, theta=10000):
@@ -85,9 +86,20 @@ class Head(nn.Module):
             e(Tensor): Shape [B, C]
         """
         e = (self.modulation + e.unsqueeze(1)).chunk(2, dim=1)
+        e = tuple(t.squeeze(1) for t in e)
         x = (self.head(self.norm(x) * (1 + e[1]) + e[0]))
         return x
 
+
+def custom_mse_loss(noise_pred, target, weighting=None, threshold=50):
+    diff = noise_pred - target[:, :noise_pred.size(1), :]
+    mse_loss = F.mse_loss(noise_pred, target[:, :noise_pred.size(1), :], reduction='none')
+    mask = (diff.abs() <= threshold).float()
+    masked_loss = mse_loss * mask
+    if weighting is not None:
+        masked_loss = masked_loss * weighting
+    final_loss = masked_loss.mean()
+    return final_loss
 
 
 def sinusoidal_embedding_1d(dim, position):
@@ -292,14 +304,24 @@ class WanTransformer3DModel(LanguageModule):
             out.append(u)
         return out
 
-    def split_cp(self, x):
+    def split_cp_sp(self, x):
+        # CP 拆分
         cp_size = parallel_state.get_context_parallel_world_size()
         cp_rank = parallel_state.get_context_parallel_rank()
         seq_len = x.size(0)
-        assert seq_len % cp_size == 0
-        intervel = seq_len // cp_size
-        x = x[(cp_rank * intervel) : (cp_rank + 1) * intervel, :, :]
-        # x = x[:, (cp_rank * intervel) : (cp_rank + 1) * intervel, :]
+        assert seq_len % cp_size == 0, "seq_len must be divisible by cp_size"
+        cp_intervel = seq_len // cp_size
+        x = x[(cp_rank * cp_intervel):(cp_rank + 1) * cp_intervel, :, :]
+
+        # TP 拆分
+        tp_size = parallel_state.get_tensor_model_parallel_world_size()
+        tp_rank = parallel_state.get_tensor_model_parallel_rank()
+        seq_len = x.size(0)
+        assert seq_len % tp_size == 0, "hidden size must be divisible by tp_size"
+        tp_interval = seq_len // tp_size
+        assert tp_interval % 2 == 0
+        x = x[(tp_rank * tp_interval):(tp_rank + 1) * tp_interval, :, :]
+
         return x
 
     def forward(
@@ -307,13 +329,12 @@ class WanTransformer3DModel(LanguageModule):
         x: Tensor,
         t: Tensor,
         context: Tensor,
-        context_mask: Tensor,
-        seq_len: int,
-        context_seqlen: int,
         grid_sizes: Tensor,
+        context_mask: Tensor,
         attention_mask: Tensor,
         clip_fea: Tensor = None,
         y: Tensor = None,
+        sigmas: Tensor = None,
         target: Tensor = None,
         y_camera: Tensor = None,
         full_ref: Tensor = None,
@@ -340,11 +361,11 @@ class WanTransformer3DModel(LanguageModule):
 
             x = [self.patch_embedding(u.unsqueeze(0)) for u in x] 
             
-            
             x = [u.flatten(2).transpose(1, 2) for u in x]
             
+            pad_seq_len = int(grid_sizes[0][0]) * int(grid_sizes[0][1]) * int(grid_sizes[0][2])
             x = torch.cat([
-                torch.cat([u, u.new_zeros(1, seq_len - u.size(1), u.size(2))],
+                torch.cat([u, u.new_zeros(1, pad_seq_len - u.size(1), u.size(2))],
                           dim=1) for u in x # padding
             ])
             
@@ -353,43 +374,38 @@ class WanTransformer3DModel(LanguageModule):
                 torch.stack([
                     torch.cat(
                         [u, u.new_zeros(self.text_len - u.size(0), u.size(1))])
-                    for u in context
+                    for u in context # padding 
                 ]))
-    
     
             if clip_fea is not None:
                 context_clip = self.img_emb(clip_fea)  # bs x 257 x dim
                 context = torch.concat([context_clip, context], dim=1)
-            
+
             x = x.transpose(0, 1).contiguous()
             context = context.transpose(0, 1).contiguous()
-
-            x = self.split_cp(x)
-        
+            x = self.split_cp_sp(x)
 
             
-
         with amp.autocast(dtype=torch.float32):
             e = self.time_embedding(
-                sinusoidal_embedding_1d(self.freq_dim, t).float()).to(torch.float16)
-            e0 = self.time_projection(e).unflatten(1, (6, self.hidden_size)).to(torch.float16)
+                sinusoidal_embedding_1d(self.freq_dim, t).float()).to(torch.bfloat16)
+            e0 = self.time_projection(e).unflatten(1, (6, self.hidden_size)).to(torch.bfloat16)
+
 
         if self.freqs.device == torch.device('cpu'):
             device = e.device
             assert device.type == 'cuda', f"Expected CUDA device, got {device}"
             self.freqs = self.freqs.cuda()
 
-        x, grid_sizes, target = self.decoder(
+
+        x = self.decoder(
             hidden_states=x,
             e = e0,
+            grid_sizes = grid_sizes,
             attention_mask=attention_mask,
-            seq_len=seq_len,
-            context_seqlen=context_seqlen,
             freqs=self.freqs,
             context=context,
             context_mask=context_mask,
-            grid_sizes=grid_sizes,
-            target=target,
             packed_seq_params=packed_seq_params,
         )
 
@@ -397,15 +413,13 @@ class WanTransformer3DModel(LanguageModule):
         if parallel_state.is_pipeline_last_stage():
             x = self.head(x, e)
             x = x.transpose(0, 1).contiguous()
-            # x = self.unpatchify(x, grid_sizes)
-            # x = x = torch.stack(x)
-            return x, target
+            weighting = compute_loss_weighting_for_sd3(weighting_scheme=None, sigmas=sigmas)
+            loss = custom_mse_loss(x.to(torch.float32), target.to(torch.float32), weighting.to(torch.float32))
+            return loss
         else:
+            raise NotImplementedError("don't support pp now!")
             grid_sizes = grid_sizes.reshape(1, grid_sizes.size(0), grid_sizes.size(1))
-            # target = target.reshape(target.size(0), target.size(1), -1)
             return [x, context, target, grid_sizes]
-
-            
 
 
     def shared_embedding_or_output_weight(self) -> Tensor:

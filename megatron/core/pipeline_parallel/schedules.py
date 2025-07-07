@@ -454,6 +454,8 @@ def check_first_val_step(first_val_step, forward_only, cond):
         return cond
 
 
+
+
 def forward_backward_no_pipelining(
     *,
     forward_step_func,
@@ -1881,6 +1883,7 @@ def forward_backward_pipelining_without_interleaving(
         - 1
     )
     num_warmup_microbatches = min(num_warmup_microbatches, num_microbatches)
+    print("num_microbatches", num_microbatches)
     num_microbatches_remaining = num_microbatches - num_warmup_microbatches
 
     # Checkpoint the activations of partial Transformer layers in a number of micro-batches

@@ -334,4 +334,4 @@ def rope_apply(x, grid_sizes, freqs):
 
         # append to collection
         output.append(x_i)
-    return torch.stack(output, dim=1).to(torch.float16)
+    return torch.stack(output, dim=1).to(torch.bfloat16)

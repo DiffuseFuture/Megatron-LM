@@ -375,8 +375,10 @@ class AspectRatioBatchImageVideoSampler(BatchSampler):
                 bucket.append(idx)
                 # yield a batch of indices in the same aspect ratio group
                 if len(bucket) == self.batch_size:
-                    dp_size = parallel_state.get_data_parallel_world_size()
-                    dp_rank = parallel_state.get_data_parallel_rank()
+                    # dp_size = parallel_state.get_data_parallel_world_size()
+                    # dp_rank = parallel_state.get_data_parallel_rank()
+                    dp_size = 1
+                    dp_rank = 0
                     assert(self.batch_size % dp_size == 0)
                     micro_batch_size = self.batch_size // dp_size
                     yield bucket[dp_rank * micro_batch_size: (dp_rank + 1) * micro_batch_size]

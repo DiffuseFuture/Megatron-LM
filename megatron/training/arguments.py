@@ -2962,5 +2962,11 @@ def _add_wan_args(parser):
                        help='Maximum length of tokens for the tokenizer.')
     group.add_argument('--transformer3d_config_path', type=str, required=True,
                         help='Path to the WAN Civitai model or resources.')
+    group.add_argument('--dataloader_num_workers', type=int, default=8,
+                       help='num workers.')
+    group.add_argument('--cpu_offloading', action='store_true',
+                    help='When set, all activations are offloaded to the CPU asynchronously.')
 
+    group.add_argument('--cpu_offloading_num_layers', type=int, default=0,
+                    help='Number of layers to offload to CPU.')
     return parser

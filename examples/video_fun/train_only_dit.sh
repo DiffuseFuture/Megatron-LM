@@ -51,8 +51,8 @@ TRAINING_ARGS=(
     --adam-beta2 0.95 
     --init-method-std 0.006 
     --clip-grad 1.0 
-    --fp16
-    --lr 6.0e-5 
+    --bf16
+    --lr 6.0e-3 
     --lr-decay-style cosine 
     --min-lr 6.0e-6
     --lr-warmup-fraction .001 
@@ -99,7 +99,7 @@ DATA_ARGS=(
     --variable_seq_lengths
     --token_sample_size 960
     --dataloader-type cyclic
-    --dataloader_num_workers 0
+    --dataloader_num_workers 12
 )
 
 EVAL_AND_LOGGING_ARGS=(
@@ -109,16 +109,16 @@ EVAL_AND_LOGGING_ARGS=(
     #--save $CHECKPOINT_PATH
     #--load $CHECKPOINT_PATH
     --eval-iters 10
-    # --profile
+    --profile
     # --profile-ranks 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15
     # --profile-ranks 0 1 2 3 4 5 6 7
     # --use-pytorch-profiler
-    # --profile-step-start 3
-    # --profile-step-end   4
+    # --profile-step-start 2
+    # --profile-step-end   3
     # --tensorboard-dir $TENSORBOARD_LOGS_PATH
 )
 
-torchrun ${DISTRIBUTED_ARGS[@]} /nas/njw1123/add_dit_new/examples/video_fun/pretrain_video_fun.py \
+torchrun ${DISTRIBUTED_ARGS[@]} /nas/njw1123/add_dit_new/examples/video_fun/pretrain_only_dit.py \
     ${GPT_MODEL_ARGS[@]} \
     ${TRAINING_ARGS[@]} \
     ${MODEL_PARALLEL_ARGS[@]} \

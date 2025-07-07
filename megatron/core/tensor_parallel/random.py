@@ -540,6 +540,8 @@ class CheckpointWithoutOutput(object):
         self.run_function = run_function
 
         self.rng_states = _get_all_rng_states()
+        print("run_function", run_function)
+        print("self.rng_states", self.rng_states)
 
         outputs = CheckpointWithoutOutputFunction.apply(run_function, self, *args)
         self.outputs = outputs

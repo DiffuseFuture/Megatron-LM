@@ -788,7 +788,6 @@ class TEDotProductAttention(te.pytorch.DotProductAttention):
             # These two arguments did not exist prior to 1.8.0. Full support added in 1.10.0 (#1012)
             self.kept_packed_seq_params.discard("cu_seqlens_q_padded")
             self.kept_packed_seq_params.discard("cu_seqlens_kv_padded")
-
         super().__init__(
             num_attention_heads=self.config.num_attention_heads,
             kv_channels=kv_channels,

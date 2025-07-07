@@ -5,6 +5,8 @@ import warnings
 from abc import ABC
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional, Union
+# from megatron.training import print_rank_0
+
 
 import torch
 import torch.distributed
@@ -1105,6 +1107,7 @@ class Transformer3dLayer(MegatronModule, BaseTransformerLayer):
         # inference_context = deprecate_inference_params(inference_context, inference_params)
 
         e = (self.modulation + e).chunk(6, dim=1)
+        e = tuple(t.squeeze(1) for t in e)
 
         # Residual connection.
         residual = hidden_states
@@ -1118,8 +1121,7 @@ class Transformer3dLayer(MegatronModule, BaseTransformerLayer):
         else:
             input_layernorm_output = self.input_layernorm(hidden_states)
         
-        input_layernorm_output = input_layernorm_output * (1 + e[1]) + e[0]
-
+        # input_layernorm_output = input_layernorm_output * (1 + e[1]) + e[0]
         # Self attention.
         nvtx_range_push(suffix="self_attention")
         attention_output_with_bias = self.self_attention(
@@ -1240,7 +1242,6 @@ class Transformer3dLayer(MegatronModule, BaseTransformerLayer):
 
         else:
             mlp_output_with_bias = self.mlp(pre_mlp_layernorm_output)
-
 
         if self.recompute_pre_mlp_layernorm:
             # discard the output of the pre-mlp layernorm and register the recompute

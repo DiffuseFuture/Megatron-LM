@@ -1,4 +1,7 @@
+#!/bin/bash
+
 export CUDA_DEVICE_MAX_CONNECTIONS=1
+export PYTHONPATH=/nas/njw1123/add_dit_new/
 
 GPUS_PER_NODE=8
 # Change for multinode config

@@ -22,6 +22,7 @@ from megatron.core.parallel_state import (
     get_tensor_model_parallel_rank,
     get_tensor_model_parallel_world_size,
 )
+
 from megatron.core.process_groups_config import ModelCommProcessGroups
 from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec, build_module
@@ -1125,11 +1126,13 @@ class WanSelfAttention(Attention):
             tp_group=self.model_comm_pgs.tp,
         )
 
+        tp_group = get_tensor_model_parallel_group()
         if submodules.q_layernorm is not None:
             self.q_layernorm = build_module(
                 submodules.q_layernorm,
                 config=self.config,
-                hidden_size=self.hidden_size_per_attention_head,
+                hidden_size=self.hidden_size_per_attention_head * self.config.num_attention_heads // tp_group.size(),
+                tp_group=tp_group,
             )
         else:
             self.q_layernorm = None
@@ -1138,7 +1141,8 @@ class WanSelfAttention(Attention):
             self.k_layernorm = build_module(
                 submodules.k_layernorm,
                 config=self.config,
-                hidden_size=self.hidden_size_per_attention_head,
+                hidden_size=self.hidden_size_per_attention_head * self.config.num_attention_heads // tp_group.size(),
+                tp_group=tp_group,
             )
         else:
             self.k_layernorm = None
@@ -1253,14 +1257,19 @@ class WanSelfAttention(Attention):
             (query, key, value) = torch.split(mixed_qkv, split_arg_list, dim=3)
 
         # [sq, b, ng, np/ng * hn] -> [sq, b, np, hn]
-        query = query.reshape(query.size(0), query.size(1), -1, self.hidden_size_per_attention_head)
+        # query = query.reshape(query.size(0), query.size(1), -1, self.hidden_size_per_attention_head)
+        # query = query.reshape(query.size(0), query.size(1), -1)
         
 
         if self.q_layernorm is not None:
+            query = query.reshape(query.size(0), query.size(1), -1)
             query = self.q_layernorm(query)
+        query = query.reshape(query.size(0), query.size(1), -1, self.hidden_size_per_attention_head)
 
         if self.k_layernorm is not None:
+            key = key.reshape(key.size(0), key.size(1), -1)
             key = self.k_layernorm(key)
+            key = key.reshape(key.size(0), key.size(1), -1, self.hidden_size_per_attention_head)
 
         if self.config.test_mode:
             self.run_realtime_tests()
@@ -1332,16 +1341,6 @@ class WanSelfAttention(Attention):
             )
         else:
             # Static batching attention kernel.
-            # query = query.transpose(0, 1).contiguous()
-            # key = key.transpose(0, 1).contiguous()
-            # value = value.transpose(0, 1).contiguous()
-            # query = query.reshape(-1, query.size(2), query.size(3))  # → [75600, 8, 64]
-            # key = key.reshape(-1, key.size(2), key.size(3))  # → [75600, 8, 64]
-            # value = value.reshape(-1, value.size(2), value.size(3))  # → [75600, 8, 64]
-            # print("attention_mask shape", attention_mask.shape)
-            # print("query shape", query.shape)
-            # print("key shape", query.shape)
-            # print("value shape", query.shape)
             core_attn_out = self.core_attention(
                 query,
                 key,
@@ -1413,21 +1412,25 @@ class WanCrossAttention(Attention):
             skip_bias_add=False,
             is_expert=False,
         )
+
+        tp_group = get_tensor_model_parallel_group()
+
+        num_heads_per_device_times_head_dim = self.hidden_size_per_attention_head * self.config.num_attention_heads // tp_group.size()
         
         self.q_layernorm = build_module(
             submodules.q_layernorm,
             config=self.config,
-            hidden_size=self.hidden_size_per_attention_head,
+            hidden_size=num_heads_per_device_times_head_dim,
+            tp_group=tp_group,
         )
 
         self.k_layernorm = build_module(
             submodules.k_layernorm,
             config=self.config,
-            hidden_size=self.hidden_size_per_attention_head,
+            hidden_size=num_heads_per_device_times_head_dim,
         )
 
         
-
         self.linear_kv = build_module(
             submodules.linear_kv,
             self.config.hidden_size,
@@ -1443,7 +1446,8 @@ class WanCrossAttention(Attention):
         self.k_layernorm_img = build_module(
             submodules.k_img_layernorm,
             config=self.config,
-            hidden_size=self.hidden_size_per_attention_head,
+            hidden_size=num_heads_per_device_times_head_dim,
+            tp_group=tp_group
         )
 
         self.linear_kv_img = build_module(
@@ -1486,7 +1490,6 @@ class WanCrossAttention(Attention):
         )
         query = query.view(*new_tensor_shape)
 
-
         mixed_kv, _ = self.linear_kv_img(context_img)
         new_tensor_shape = mixed_kv.size()[:-1] + (
             self.num_attention_heads_per_partition,
@@ -1495,9 +1498,17 @@ class WanCrossAttention(Attention):
         mixed_kv = mixed_kv.view(*new_tensor_shape)
         (key_img, value_img) = tensor_parallel.split_tensor_along_last_dim(mixed_kv, 2)
 
+        query = query.reshape(query.size(0), query.size(1), -1)
         query = self.q_layernorm(query)
-        ley = self.k_layernorm(query)
+        query = query.reshape(query.size(0), query.size(1), -1, self.hidden_size_per_attention_head)
+
+        key = key.reshape(key.size(0), key.size(1), -1)
+        key = self.k_layernorm(key)
+        key = key.reshape(key.size(0), key.size(1), -1, self.hidden_size_per_attention_head)
+
+        key_img = key_img.reshape(key_img.size(0), key_img.size(1), -1)
         key_img = self.k_layernorm_img(key_img)
+        key_img = key_img.reshape(key_img.size(0), key_img.size(1), -1, self.hidden_size_per_attention_head)
 
         return query, key, value, key_img, value_img
 
@@ -1539,8 +1550,8 @@ class WanCrossAttention(Attention):
             )
         else:
             # Static batching attention kernel.
-
-            attention_mask_img = (attention_mask[0], attention_mask[2])
+            # attention_mask_img = (attention_mask[0], attention_mask[2])
+            attention_mask_img = None
             core_attn_out_img = self.core_attention(
                 query,
                 key_img,
@@ -1550,8 +1561,9 @@ class WanCrossAttention(Attention):
                 packed_seq_params=packed_seq_params,
             )
 
-            attention_mask_x = (attention_mask[0], attention_mask[1])
-            packed_seq_params
+            # attention_mask_x = (attention_mask[0], attention_mask[1])
+            attention_mask_x = None
+            # packed_seq_params
             core_attn_out = self.core_attention(
                 query,
                 key,
@@ -1576,7 +1588,7 @@ class WanCrossAttention(Attention):
         # Output. [sq, b, h]
         # =================
 
-        hidden_state = core_attn_out_img[0] + core_attn_out[0]
+        hidden_state = core_attn_out_img + core_attn_out
 
         nvtx_range_push(suffix="linear_proj")
         output, bias = self.linear_proj(hidden_state)

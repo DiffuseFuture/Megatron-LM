@@ -15,14 +15,12 @@ import numpy as np
 from torchvision import transforms
 
 
-
-
 def test():
     args = Namespace()
-    args.train_data_meta="/root/add_dit/test_data/test.json"
-    args.train_data_dir="/root/add_dit/test_data"
+    args.train_data_meta="/nas/njw1123/test_data/test.json"
+    args.train_data_dir="/nas/njw1123/test_data"
     args.video_sample_size=960
-    args.token_sample_size=512
+    args.token_sample_size=960
     args.video_sample_stride=2
     args.video_sample_n_frames=81
     args.video_repeat=1
@@ -158,12 +156,12 @@ def test():
             aspect_ratio_random_crop_sample_size = {key : [x / 512 * args.video_sample_size / random_downsample_ratio for x in ASPECT_RATIO_RANDOM_CROP_512[key]] for key in ASPECT_RATIO_RANDOM_CROP_512.keys()}
 
         closest_size, closest_ratio = get_closest_ratio(h, w, ratios=aspect_ratio_sample_size)
-        closest_size = [int(x / 16) * 16 for x in closest_size]
+        closest_size = [int(x / 64) * 64 for x in closest_size]
         if args.random_ratio_crop:
             random_sample_size = aspect_ratio_random_crop_sample_size[
                 np.random.choice(list(aspect_ratio_random_crop_sample_size.keys()), p = ASPECT_RATIO_RANDOM_CROP_PROB)
             ]
-            random_sample_size = [int(x / 16) * 16 for x in random_sample_size]
+            random_sample_size = [int(x / 64) * 64 for x in random_sample_size]
 
         for example in examples:
             if args.random_ratio_crop:
@@ -268,12 +266,16 @@ def test():
 if __name__ == "__main__":
     data_loader = test()
     for batch in data_loader:
-        print("====== New Batch ======")
         for key, value in batch.items():
-            if isinstance(value, torch.Tensor):
-                print(f"{key}: {value.shape}")
-            elif isinstance(value, list):
-                print(f"{key}: list of length {len(value)}")
-            else:
-                print(f"{key}: {type(value)}")
-        # break  # Remove this break if you want to see more than one batch
+            if key == "pixel_values":
+                    
+                shape = value.shape
+                print(f"{key}: {shape}")
+
+                # 如果 shape 至少包含 5 个维度
+                if len(shape) >= 5:
+                    ans = shape[1] * shape[3] * shape[4] / 4 % 32
+                    print("ans", shape[1] * shape[3] * shape[4] / 4096, shape[3] * shape[4] % 8192 )
+                # print(f"    >> (dim1/64, dim3/64, dim4/64): ({second:.2f}, {fourth:.2f}, {fifth:.2f})")
+
+            # break  # Remove this break if you want to see more than one batch

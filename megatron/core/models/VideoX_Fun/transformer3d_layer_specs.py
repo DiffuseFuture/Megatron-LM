@@ -104,7 +104,7 @@ def get_transformer3d_transformer_engine_block_spec(
             ),
             cross_attention=ModuleSpec(
                 module=WanCrossAttention,
-                params={"attn_mask_type": AttnMaskType.padding},
+                params={"attn_mask_type": AttnMaskType.no_mask},
                 submodules=WanCrossAttentionSubmodules(
                     linear_q=TEColumnParallelLinear,
                     linear_kv=TEColumnParallelLinear,

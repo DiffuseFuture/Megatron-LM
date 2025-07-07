@@ -6,6 +6,10 @@ from torch import nn
 from megatron.core.jit import jit_fuser
 from megatron.core.transformer import TransformerConfig
 from megatron.core.utils import is_torch_min_version
+from megatron.core import parallel_state
+from megatron.core.utils import divide, get_tensor_model_parallel_group_if_none, is_torch_min_version
+from megatron.core.tensor_parallel.mappings import reduce_from_tensor_model_parallel_region
+from typing import Optional
 
 
 class WrappedTorchNorm:
@@ -99,23 +103,23 @@ class L2Norm(torch.nn.Module):
 
 
 
-class WanRMSNorm(torch.nn.Module):
+# class WanRMSNorm(torch.nn.Module):
 
-    def __init__(self, config, hidden_size):
-        super().__init__()
-        self.hidden_size = hidden_size
-        self.eps = config.layernorm_epsilon
-        self.weight = nn.Parameter(torch.ones(hidden_size))
+#     def __init__(self, config, hidden_size):
+#         super().__init__()
+#         self.hidden_size = hidden_size
+#         self.eps = config.layernorm_epsilon
+#         self.weight = nn.Parameter(torch.ones(hidden_size))
 
-    def forward(self, x):
-        r"""
-        Args:
-            x(Tensor): Shape [B, L, C]
-        """
-        return self._norm(x.float()).type_as(x) * self.weight
+#     def forward(self, x):
+#         r"""
+#         Args:
+#             x(Tensor): Shape [B, L, C]
+#         """
+#         return self._norm(x.float()).type_as(x) * self.weight
 
-    def _norm(self, x):
-        return x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
+#     def _norm(self, x):
+#         return x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
 
 
 class WanLayerNorm(torch.nn.LayerNorm):
@@ -130,3 +134,37 @@ class WanLayerNorm(torch.nn.LayerNorm):
         """
         return super().forward(x.float()).type_as(x)
 
+
+
+
+class WanRMSNorm(torch.nn.Module):
+
+    def __init__(self,
+                 config,
+                 hidden_size,
+                 tp_group: Optional[torch.distributed.ProcessGroup] = None,):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.eps = config.layernorm_epsilon
+        self.tp_group = tp_group
+        self.weight = nn.Parameter(torch.ones(self.hidden_size))
+
+    def forward(self, x):
+        r"""
+        Args:
+            x(Tensor): Shape [B, S, H, D] or [S, B, H, D]
+        """
+        return self._norm(x.float()).type_as(x) * self.weight
+
+    def _norm(self, x):
+        hidden_size = x.size(-1)
+        assert hidden_size == self.hidden_size
+        global_mean = None
+
+        if self.tp_group is not None:
+            local_mean = x.pow(2).mean(dim = -1,  keepdim=True) / self.tp_group.size()
+            global_mean = reduce_from_tensor_model_parallel_region(local_mean, group=self.tp_group)
+        else:
+            global_mean = x.pow(2).mean(dim=-1, keepdim=True) 
+        
+        return x * torch.rsqrt(global_mean + self.eps)

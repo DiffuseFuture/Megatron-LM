@@ -896,35 +896,35 @@ def pretrain(
 
         iteration = args.iteration
 
-    if args.do_valid:
-        prefix = f'iteration {iteration} on validation set'
-        evaluate_and_print_results(
-            prefix,
-            forward_step_func,
-            valid_data_iterator,
-            model,
-            iteration,
-            process_non_loss_data_func,
-            config,
-            verbose=True,
-            write_to_tensorboard=not args.skip_train,
-            non_loss_data_func=non_loss_data_func,
-        )
+    # if args.do_valid:
+    #     prefix = f'iteration {iteration} on validation set'
+    #     evaluate_and_print_results(
+    #         prefix,
+    #         forward_step_func,
+    #         valid_data_iterator,
+    #         model,
+    #         iteration,
+    #         process_non_loss_data_func,
+    #         config,
+    #         verbose=True,
+    #         write_to_tensorboard=not args.skip_train,
+    #         non_loss_data_func=non_loss_data_func,
+    #     )
 
-    if args.do_test:
-        prefix = f'iteration {iteration} on test set'
-        evaluate_and_print_results(
-            prefix,
-            forward_step_func,
-            test_data_iterator,
-            model,
-            iteration,
-            process_non_loss_data_func,
-            config,
-            verbose=True,
-            write_to_tensorboard=not args.skip_train,
-            non_loss_data_func=non_loss_data_func,
-        )
+    # if args.do_test:
+    #     prefix = f'iteration {iteration} on test set'
+    #     evaluate_and_print_results(
+    #         prefix,
+    #         forward_step_func,
+    #         test_data_iterator,
+    #         model,
+    #         iteration,
+    #         process_non_loss_data_func,
+    #         config,
+    #         verbose=True,
+    #         write_to_tensorboard=not args.skip_train,
+    #         non_loss_data_func=non_loss_data_func,
+    #     )
 
     wandb_writer = get_wandb_writer()
     if wandb_writer:
@@ -1348,6 +1348,7 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
     """Single training step."""
     args = get_args()
     timers = get_timers()
+    now = datetime.now()
 
     # CUDA Graph capturing only executes once, when it's the first training iteration.
     if args.curr_iteration == args.iteration and args.external_cuda_graph:
@@ -1378,17 +1379,13 @@ def train_step(forward_step_func, data_iterator, model, optimizer, opt_param_sch
             adjust_tensor_shapes_fn = None
 
         # Forward pass.
-        args.hidden_state_seqlen = 21060
-        args.context_seqlen = 769
         forward_backward_func = get_forward_backward_func()
         losses_reduced = forward_backward_func(
             forward_step_func=forward_step_func,
             data_iterator=data_iterator,
             model=model,
             num_microbatches=get_num_microbatches(),
-            # seq_length=args.seq_length,
-            seq_length=args.hidden_state_seqlen,
-            context_seq_length=args.context_seqlen,
+            seq_length=args.seq_length,
             micro_batch_size=args.micro_batch_size,
             decoder_seq_length=args.decoder_seq_length,
             forward_only=False,
@@ -1877,6 +1874,8 @@ def post_training_step_callbacks(
     ):
         if args.use_pytorch_profiler:
             assert prof is not None
+            # prof.export_memory_timeline(f"/nas/njw1123/add_dit/examples/video_fun/{f}.html", device="cuda:0")
+            prof.export_chrome_trace(f"/nas/njw1123/add_dit_new/examples/video_fun/prof/kernel_rank{args.rank}.json")
             prof.stop()
         else:
             torch.cuda.cudart().cudaProfilerStop()
@@ -2146,14 +2145,18 @@ def train(
                 active=args.profile_step_end - args.profile_step_start,
                 repeat=1,
             ),
-            on_trace_ready=torch.profiler.tensorboard_trace_handler(args.tensorboard_dir),
-            record_shapes=True,
-            with_stack=True,
+            # on_trace_ready=torch.profiler.tensorboard_trace_handler(args.tensorboard_dir),
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ],
+            record_shapes=True,        # ✅ 记录每个 op 的张量 shape
+            # profile_memory=True,       # ✅ 显存分配 + 释放追踪
         )
         prof.start()
 
     start_iteration = iteration
-    # Disable forward pre-hook to start training to ensure that errors in checkpoint loading
+    # Disable forward pre-hook to start training to ensure that errors in checkpoint loadingwww we e
     # or random initialization don't propagate to all ranks in first all-gather (which is a
     # no-op if things work correctly).
     if should_disable_forward_pre_hook(args):
@@ -2313,40 +2316,40 @@ def train(
         )
 
         # Evaluation.
-        if args.eval_interval and iteration % args.eval_interval == 0 and args.do_valid:
-            timers('interval-time').stop()
-            if should_disable_forward_pre_hook(args):
-                disable_forward_pre_hook(model)
-                pre_hook_enabled = False
-            if args.manual_gc and args.manual_gc_eval:
-                # Collect all objects.
-                gc.collect()
-            prefix = f'iteration {iteration}'
-            timers('eval-time', log_level=0).start(barrier=True)
-            evaluate_and_print_results(
-                prefix,
-                forward_step_func,
-                valid_data_iterator,
-                model,
-                iteration,
-                process_non_loss_data_func,
-                config,
-                verbose=False,
-                write_to_tensorboard=True,
-                non_loss_data_func=non_loss_data_func,
-            )
-            eval_duration += timers('eval-time').elapsed()
-            eval_iterations += args.eval_iters
-            timers('eval-time').stop()
-            one_logger_utils.track_e2e_metrics()
+        # if args.eval_interval and iteration % args.eval_interval == 0 and args.do_valid:
+        #     timers('interval-time').stop()
+        #     if should_disable_forward_pre_hook(args):
+        #         disable_forward_pre_hook(model)
+        #         pre_hook_enabled = False
+        #     if args.manual_gc and args.manual_gc_eval:
+        #         # Collect all objects.
+        #         gc.collect()
+        #     prefix = f'iteration {iteration}'
+        #     timers('eval-time', log_level=0).start(barrier=True)
+        #     evaluate_and_print_results(
+        #         prefix,
+        #         forward_step_func,
+        #         valid_data_iterator,
+        #         model,
+        #         iteration,
+        #         process_non_loss_data_func,
+        #         config,
+        #         verbose=False,
+        #         write_to_tensorboard=True,
+        #         non_loss_data_func=non_loss_data_func,
+        #     )
+        #     eval_duration += timers('eval-time').elapsed()
+        #     eval_iterations += args.eval_iters
+        #     timers('eval-time').stop()
+        #     one_logger_utils.track_e2e_metrics()
 
-            if args.manual_gc and args.manual_gc_eval:
-                # Collect only the objects created and used in evaluation.
-                gc.collect(generation=0)
-            if should_disable_forward_pre_hook(args):
-                enable_forward_pre_hook(model)
-                pre_hook_enabled = True
-            timers('interval-time', log_level=0).start(barrier=True)
+        #     if args.manual_gc and args.manual_gc_eval:
+        #         # Collect only the objects created and used in evaluation.
+        #         gc.collect(generation=0)
+        #     if should_disable_forward_pre_hook(args):
+        #         enable_forward_pre_hook(model)
+        #         pre_hook_enabled = True
+        #     timers('interval-time', log_level=0).start(barrier=True)
 
         # Miscellaneous post-training-step functions (e.g., FT heartbeats, GC).
         # Some of these only happen at specific iterations.
