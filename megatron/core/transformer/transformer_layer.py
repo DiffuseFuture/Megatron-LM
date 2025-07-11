@@ -510,7 +510,6 @@ class TransformerLayer(MegatronModule, BaseTransformerLayer):
             sequence_len_offset=sequence_len_offset,
         )
         nvtx_range_pop(suffix="self_attention")
-
         if self.recompute_input_layernorm:
             # discard the output of the input layernorm and register the recompute
             # as a gradient hook of attention_output_with_bias[0]
@@ -1121,8 +1120,9 @@ class Transformer3dLayer(MegatronModule, BaseTransformerLayer):
         else:
             input_layernorm_output = self.input_layernorm(hidden_states)
         
-        # input_layernorm_output = input_layernorm_output * (1 + e[1]) + e[0]
+        input_layernorm_output = input_layernorm_output * (1 + e[1]) + e[0]
         # Self attention.
+
         nvtx_range_push(suffix="self_attention")
         attention_output_with_bias = self.self_attention(
             input_layernorm_output,

@@ -265,6 +265,7 @@ class GPTModel(LanguageModule):
         # If decoder_input is provided (not None), then input_ids and position_ids are ignored.
         # Otherwise, apply embedding layer on input_ids and position_ids to get decoder_input.
 
+        print("input_ids", input_ids.shape)
         inference_context = deprecate_inference_params(inference_context, inference_params)
 
         # Decoder embedding.

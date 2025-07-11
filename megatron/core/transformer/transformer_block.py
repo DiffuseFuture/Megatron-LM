@@ -221,7 +221,6 @@ def _get_block_submodules(
             return spec.submodules
         elif issubclass(spec.module, BaseTransformerLayer):
             num_layers = get_num_layers_to_build(config, vp_stage)
-            print("num_layers", num_layers)
             return TransformerBlockSubmodules(
                 layer_specs=[spec] * num_layers, layer_norm=None
             )
@@ -770,19 +769,21 @@ class Transformer3DBlock(MegatronModule):
     def _checkpointed_forward(
         self,
         hidden_states: Tensor,
+        e: Tensor,
+        grid_sizes: Tensor,
         attention_mask: Tensor,
+        freqs: Tensor,
         context: Tensor,
         context_mask: Tensor,
-        rotary_pos_emb: Tensor,
-        attention_bias: Tensor,
         packed_seq_params: PackedSeqParams,
-        use_inner_fp8_context: bool,
+        use_inner_fp8_context: bool = False,
     ):
         """Forward method with activation checkpointing."""
 
         def custom(start: int, end: int):
             def custom_forward(
-                hidden_states, attention_mask, context, context_mask, rotary_pos_emb
+                hidden_states, e, attention_mask, context, 
+                context_mask, freqs, grid_sizes, packed_seq_params
             ):
                 for index in range(start, end):
                     layer = self._get_layer(index)
@@ -794,12 +795,12 @@ class Transformer3DBlock(MegatronModule):
                     with inner_fp8_context:
                         hidden_states, context = layer(
                             hidden_states=hidden_states,
+                            e=e,
                             attention_mask=attention_mask,
                             context=context,
                             context_mask=context_mask,
-                            rotary_pos_emb=rotary_pos_emb,
-                            attention_bias=attention_bias,
-                            inference_context=None,
+                            freqs=freqs,
+                            grid_sizes=grid_sizes,
                             packed_seq_params=packed_seq_params,
                         )
                 return hidden_states, context
@@ -815,20 +816,26 @@ class Transformer3DBlock(MegatronModule):
                     tensor_parallel.random.get_cuda_rng_tracker,
                     parallel_state.get_tensor_model_parallel_group(),
                     hidden_states,
+                    e,
                     attention_mask,
                     context,
                     context_mask,
-                    rotary_pos_emb,
+                    freqs,
+                    grid_sizes, 
+                    packed_seq_params
                 )
             else:
                 return tensor_parallel.checkpoint(
                     forward_func,
                     self.config.distribute_saved_activations,
                     hidden_states,
+                    e,
                     attention_mask,
                     context,
                     context_mask,
-                    rotary_pos_emb,
+                    freqs,
+                    grid_sizes, 
+                    packed_seq_params
                 )
 
         if self.config.recompute_method == 'uniform':
@@ -861,7 +868,14 @@ class Transformer3DBlock(MegatronModule):
                     hidden_states, context = checkpoint_handler(custom(layer_idx, layer_idx + 1))
                 else:
                     hidden_states, context = custom(layer_idx, layer_idx + 1)(
-                        hidden_states, attention_mask, context, context_mask, rotary_pos_emb
+                        hidden_states,
+                        e,
+                        attention_mask,
+                        context,
+                        context_mask,
+                        freqs,
+                        grid_sizes, 
+                        packed_seq_params
                     )
         else:
             raise ValueError("Invalid activation recompute method.")
@@ -978,13 +992,16 @@ class Transformer3DBlock(MegatronModule):
         with rng_context, outer_fp8_context:
             # Forward pass.
             if self.config.recompute_granularity == 'full' and self.training:
-                raise NotImplementedError("Recompute granularity is not implemented for Transformer3DBlock")
+                # raise NotImplementedError("Recompute granularity is not implemented for Transformer3DBlock")
                 hidden_states = self._checkpointed_forward(
                     hidden_states=hidden_states,
+                    e=e,
                     attention_mask=attention_mask,
                     context=context,
+                    context_mask=context_mask,
+                    freqs=freqs,
+                    grid_sizes=grid_sizes,
                     packed_seq_params=packed_seq_params,
-                    use_inner_fp8_context=use_inner_fp8_context,
                 )
             else:
                 for l_no, layer in enumerate(self.layers):

@@ -398,6 +398,7 @@ def _set_random_seed(
         # Ensure different data parallel ranks get different seeds
         if data_parallel_random_init:
             seed = seed + (10 * mpu.get_data_parallel_rank())
+        device = torch.cuda.current_device()
         random.seed(seed)
         np.random.seed(seed)
         torch.manual_seed(seed)

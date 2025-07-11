@@ -3,21 +3,21 @@
 # Runs the "175B" parameter model
 
 export CUDA_DEVICE_MAX_CONNECTIONS=1
-export CUDA_LAUNCH_BLOCKING=1
+export NCCL_DEBUG=WARN
 
-GPUS_PER_NODE=8
+GPUS_PER_NODE=2
 # Change for multinode config
 MASTER_ADDR=localhost
-MASTER_PORT=6001
+MASTER_PORT=23457
 NUM_NODES=1
 NODE_RANK=0
 WORLD_SIZE=$(($GPUS_PER_NODE*$NUM_NODES))
 
-CHECKPOINT_PATH=/jizhicfs/marvinhjia/njw1123/Megatron-LM/gpt2
-TENSORBOARD_LOGS_PATH=/jizhicfs/marvinhjia/njw1123/Megatron-LM/output
-VOCAB_FILE=/jizhicfs/marvinhjia/njw1123/Megatron-LM/gpt2/gpt2-vocab.json
-MERGE_FILE=/jizhicfs/marvinhjia/njw1123/Megatron-LM/gpt2/gpt2-merges.txt
-DATA_PATH=/jizhicfs/marvinhjia/njw1123/Megatron-LM/examples/gpt3/web_content_document
+CHECKPOINT_PATH=/nas/njw1123/add_dit_new/examples/gpt3/
+TENSORBOARD_LOGS_PATH=/nas/njw1123/add_dit_new/examples/gpt3/output
+VOCAB_FILE=/nas/njw1123/add_dit_new/examples/gpt3/gpt2-vocab.json
+MERGE_FILE=/nas/njw1123/add_dit_new/examples/gpt3/gpt2-merges.txt
+DATA_PATH=/nas/njw1123/add_dit_new/examples/gpt3/web_content_document
 
 DISTRIBUTED_ARGS=(
     --nproc_per_node $GPUS_PER_NODE 
@@ -31,20 +31,20 @@ GPT_MODEL_ARGS=(
     # --hidden-size 12288 
     # --num-attention-heads 96 
     # --seq-length 2048 
-    --max-position-embeddings 2048 
+    --max-position-embeddings  8192
     --attention-backend auto # Can use (flash/fused/unfused/local)
-   --num-layers 30 
-   --hidden-size 512 
-   --num-attention-heads 8 
-   --seq-length 1024 
-   # --tensor-model-parallel-size 4
+    --num-layers 24
+    --hidden-size 512 
+    --num-attention-heads 8 
+    --seq-length 8192
+   # --tensor-model-parallel-size 1 
    # --pipeline-model-parallel-size 1 
 )
 
 TRAINING_ARGS=(
     --micro-batch-size 1 
-    --global-batch-size 2
-    --train-iters 1
+    --global-batch-size 8 
+    --train-iters 500000 
     --weight-decay 0.1 
     --adam-beta1 0.9 
     --adam-beta2 0.95 
@@ -58,18 +58,17 @@ TRAINING_ARGS=(
     --lr-decay-iters 430000 
     --no-persist-layer-norm
     --no-gradient-accumulation-fusion
-    --untie-embeddings-and-output-weights
+    --recompute-granularity "full"
+    --recompute-activations
 )
 
 
-    --master_addr $MASTER_ADDR
-    --master_port $MASTER_PORT
 MODEL_PARALLEL_ARGS=(
-        # --tensor-model-parallel-size 8
-        # --pipeline-model-parallel-size 16
-        --tensor-model-parallel-size 2
-        --pipeline-model-parallel-size 2
-       # --transformer-impl local
+    # --tensor-model-parallel-size 8
+    # --pipeline-model-parallel-size 16
+    --tensor-model-parallel-size 2
+    --pipeline-model-parallel-size 1
+    --transformer-impl local
 )
 
 DATA_ARGS=(
@@ -89,7 +88,7 @@ EVAL_AND_LOGGING_ARGS=(
     --tensorboard-dir $TENSORBOARD_LOGS_PATH
 )
 
-torchrun ${DISTRIBUTED_ARGS[@]} /jizhicfs/marvinhjia/MLSys/wan/megatron/Megatron-LM/pretrain_wan.py \
+torchrun ${DISTRIBUTED_ARGS[@]} /nas/njw1123/add_dit_new/pretrain_gpt.py \
     ${GPT_MODEL_ARGS[@]} \
     ${TRAINING_ARGS[@]} \
     ${MODEL_PARALLEL_ARGS[@]} \

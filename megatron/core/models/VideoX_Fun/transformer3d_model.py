@@ -385,6 +385,8 @@ class WanTransformer3DModel(LanguageModule):
             context = context.transpose(0, 1).contiguous()
             x = self.split_cp_sp(x)
 
+            print("x shape", x.shape)
+
             
         with amp.autocast(dtype=torch.float32):
             e = self.time_embedding(

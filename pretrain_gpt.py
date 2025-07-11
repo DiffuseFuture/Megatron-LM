@@ -1,3 +1,4 @@
+
 # Copyright (c) 2023, NVIDIA CORPORATION.  All rights reserved.
 
 """Pretrain GPT."""
@@ -5,7 +6,6 @@
 import datetime
 import os
 import torch
-import copy
 
 from functools import partial
 from typing import List, Optional, Tuple, Union
@@ -18,30 +18,23 @@ from megatron.training import get_tokenizer
 from megatron.core import mpu
 from megatron.core.enums import ModelType
 from megatron.core.datasets.blended_megatron_dataset_builder import BlendedMegatronDatasetBuilder
-# from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, MockGPTDataset
+from megatron.core.datasets.gpt_dataset import GPTDataset, GPTDatasetConfig, MockGPTDataset
 from megatron.core.enums import ModelType
-from megatron.core.transformer.module import Float16Module
-
-from megatron.core.models.VideoX_Fun.transformer3d_layer_specs import (
-    get_transformer3d_layer_local_spec,
+from megatron.core.models.gpt import GPTModel
+from megatron.core.models.gpt.gpt_layer_specs import (
+    get_gpt_decoder_block_spec,
+    get_gpt_layer_local_spec,
+    get_gpt_layer_with_transformer_engine_spec,
+    get_gpt_mtp_block_spec,
 )
-
-from megatron.core.models.T5.t5_spec import (
-    get_t5_encoder_with_transformer_engine_block_spec,
-    get_t5_encoder_with_local_block_spec,
+from megatron.core.models.gpt.heterogeneous.heterogeneous_layer_specs import (
+    get_gpt_heterogeneous_layer_spec,
 )
-
-from megatron.core.models.VideoX_Fun import WanTransformer3DModel
-from megatron.core.models.T5 import T5Model
-
-# from megatron.core.models.gpt.heterogeneous.heterogeneous_layer_specs import (
-#     get_gpt_heterogeneous_layer_spec,
-# )
 from megatron.core.rerun_state_machine import get_rerun_state_machine
 from megatron.core.transformer.spec_utils import import_module
 from megatron.core.utils import StragglerDetector
 from megatron.training import get_args, get_timers, get_tokenizer, pretrain, print_rank_0
-from megatron.training.arguments import core_transformer3d_config_from_args
+from megatron.training.arguments import core_transformer_config_from_args
 from megatron.training.utils import (
     get_batch_on_this_cp_rank,
     get_batch_on_this_tp_rank,
@@ -65,14 +58,9 @@ except ImportError:
 stimer = StragglerDetector()
 
 
-t5_model = None
-dit_model = None
-
-
-
 def model_provider(
     pre_process=True, post_process=True, vp_stage: Optional[int] = None
-) -> Union[WanTransformer3DModel]:
+) -> Union[GPTModel, megatron.legacy.model.GPTModel]:
     """Builds the model.
 
     If you set the use_legacy_models to True, it will return the legacy GPT model and if not the mcore GPT model.
@@ -89,6 +77,8 @@ def model_provider(
 
     if has_nvidia_modelopt and modelopt_args_enabled(args):  # [ModelOpt]
         return model_provider_modelopt(pre_process, post_process)
+
+    use_te = args.transformer_impl == "transformer_engine"
 
     if args.record_memory_history:
         torch.cuda.memory._record_memory_history(
@@ -112,27 +102,61 @@ def model_provider(
 
         torch._C._cuda_attach_out_of_memory_observer(oom_observer)
 
-    
-    print_rank_0('building WanTransformer3D model ...')
+    print_rank_0('building GPT model ...')
     # Experimental loading arguments from yaml
-    config = core_transformer3d_config_from_args(args)
+    if args.yaml_cfg is not None:
+        config = core_transformer_config_from_yaml(args, "language_model")
+    else:
+        config = core_transformer_config_from_args(args)
 
-    if parallel_state.is_pipeline_first_stage():
-        
-        t5_config = copy.deepcopy(config)
-        encoder_config = copy.deepcopy(config)
-
-        en_block_spec = get_t5_encoder_with_local_block_spec(
-            config.num_layers
+    if args.use_legacy_models:
+        model = megatron.legacy.model.GPTModel(
+            config,
+            num_tokentypes=0,
+            parallel_output=True,
+            pre_process=pre_process,
+            post_process=post_process,
         )
+    else:  # using core models
+        if args.spec is not None:
+            transformer_layer_spec = import_module(args.spec)
+        else:
+            if args.num_experts:
+                # Define the decoder block spec
+                transformer_layer_spec = get_gpt_decoder_block_spec(
+                    config, use_transformer_engine=use_te, normalization=args.normalization, qk_l2_norm=args.qk_l2_norm, vp_stage=vp_stage
+                )
+            elif args.heterogeneous_layers_config_path is not None:
+                transformer_layer_spec = get_gpt_heterogeneous_layer_spec(config, use_te)
+            else:
+                # Define the decoder layer spec
+                if use_te:
+                    transformer_layer_spec = get_gpt_layer_with_transformer_engine_spec(
+                        args.num_experts,
+                        args.moe_grouped_gemm,
+                        args.qk_layernorm,
+                        args.multi_latent_attention,
+                        args.moe_use_legacy_grouped_gemm,
+                        qk_l2_norm=args.qk_l2_norm
+                    )
+                else:
+                    transformer_layer_spec = get_gpt_layer_local_spec(
+                        args.num_experts,
+                        args.moe_grouped_gemm,
+                        args.qk_layernorm,
+                        args.multi_latent_attention,
+                        args.moe_use_legacy_grouped_gemm,
+                        normalization=args.normalization,
+                    )
+        mtp_block_spec = None
+        if args.mtp_num_layers is not None:
+            mtp_block_spec = get_gpt_mtp_block_spec(
+                config, transformer_layer_spec, use_transformer_engine=use_te, vp_stage=vp_stage
+            )
 
-        global t5_model
-        
-        t5_model = T5Model(
-            config=t5_config,
-            encoder_config=encoder_config,
-            transformer_encoder_layer_spec=en_block_spec,
-            transformer_decoder_layer_spec=None,
+        model = GPTModel(
+            config=config,
+            transformer_layer_spec=transformer_layer_spec,
             vocab_size=args.padded_vocab_size,
             max_sequence_length=args.max_position_embeddings,
             pre_process=pre_process,
@@ -142,38 +166,13 @@ def model_provider(
             share_embeddings_and_output_weights=not args.untie_embeddings_and_output_weights,
             position_embedding_type=args.position_embedding_type,
             rotary_percent=args.rotary_percent,
-            relative_attention_num_buckets=args.relative_attention_num_buckets,
-            relative_attention_max_distance=args.relative_attention_max_distance,
-            add_encoder=True,
-            add_decoder=False,
+            rotary_base=args.rotary_base,
+            rope_scaling=args.use_rope_scaling,
+            mtp_block_spec=mtp_block_spec,
+            vp_stage=vp_stage,
         )
-        t5_model.cuda(torch.cuda.current_device())
-        t5_model = Float16Module(t5_config, t5_model)
 
-    
-    transformer_layer_spec = get_transformer3d_layer_local_spec()
-
-    global dit_model
-    dit_model = WanTransformer3DModel(
-        config=config,
-        transformer_layer_spec=transformer_layer_spec,
-        vocab_size=args.padded_vocab_size,
-        max_sequence_length=args.max_position_embeddings,
-        pre_process=pre_process,
-        post_process=post_process,
-        fp16_lm_cross_entropy=args.fp16_lm_cross_entropy,
-        parallel_output=True,
-        share_embeddings_and_output_weights=not args.untie_embeddings_and_output_weights,
-        position_embedding_type=args.position_embedding_type,
-        rotary_percent=args.rotary_percent,
-        rotary_base=args.rotary_base,
-        rope_scaling=args.use_rope_scaling,
-        mtp_block_spec=None,
-        vp_stage=vp_stage,
-    )
-
-    # return [t5_model, dit_model]
-    return dit_model
+    return model
 
 
 def get_batch(data_iterator):
@@ -188,6 +187,10 @@ def get_batch(data_iterator):
     # get batches based on the TP rank you are on
     batch = get_batch_on_this_tp_rank(data_iterator)
 
+    # tokens, labels, loss_mask, attention_mask, position_ids = batch.values()
+
+    # print("token.shape", tokens.shape)
+
     # slice batch along sequence dimension for context parallelism
     batch = get_batch_on_this_cp_rank(batch)
 
@@ -199,7 +202,7 @@ SPIKY_LOSS_FACTOR = 10
 
 
 def loss_func(
-    loss_mask: torch.Tensor, output_tensor: torch.Tensor, model: Optional[WanTransformer3DModel] = None
+    loss_mask: torch.Tensor, output_tensor: torch.Tensor, model: Optional[GPTModel] = None
 ):
     """Loss function.
 
@@ -220,9 +223,8 @@ def loss_func(
         return loss_func_modelopt(loss_mask, output_tensor, model=model)
 
     losses = output_tensor.view(-1).float()
-    # loss_mask = loss_mask.view(-1).float()
-    # loss = torch.sum(losses * loss_mask)
-    loss = torch.sum(losses)
+    loss_mask = loss_mask.view(-1).float()
+    loss = torch.sum(losses * loss_mask)
 
     # Check individual rank losses are not NaN prior to DP all-reduce.
     rerun_state_machine = get_rerun_state_machine()
@@ -261,7 +263,7 @@ def loss_func(
     return (loss, num_tokens, {'lm loss': reporting_loss})
 
 
-def forward_step(data_iterator, model: WanTransformer3DModel):
+def forward_step(data_iterator, model: GPTModel):
     """Forward training step.
 
     Args:
@@ -278,40 +280,13 @@ def forward_step(data_iterator, model: WanTransformer3DModel):
         tokens, labels, loss_mask, attention_mask, position_ids = get_batch(data_iterator)
     timers('batch-generator').stop()
 
-    
     with stimer:
-        if(tokens is not None):
-            device = tokens.device
-            x = torch.randn(1, 16, 6, 90, 156, device=device, dtype=torch.float16)
-            t = torch.tensor([0], device=device)  # 假设 t 是时间步长标记之类的
-            context = [torch.randn(209, 512, device=device, dtype=torch.float16)]
-            # context_mask =  torch.tril(torch.ones((1, 1, 21060, 209), device=context_ids.device, dtype=torch.bool))
-            seqlen = 21060  # 这是个整数，不用放 device 上
-            y = torch.randn(1, 20, 6, 90, 156, device=device, dtype=torch.float16)
-            clip_fea = torch.randn(1, 257, 1280, device=device, dtype=torch.float16)
+        if args.use_legacy_models:
+            output_tensor = model(tokens, position_ids, attention_mask, labels=labels)
         else:
-            x = None
-            t = torch.tensor([0]).cuda()  # 假设 t 是时间步长标记之类的
-            context = None
-            seqlen = None
-            clip_fea = None
-            y = None
-        if parallel_state.is_pipeline_first_stage():
-            context_ids = torch.ones((1, 209), dtype=torch.int64).cuda()
-            causal_mask = torch.tril(torch.ones((1, 209, 209), device=context_ids.device, dtype=torch.bool))
-            t5_model.eval()
-            context = t5_model(context_ids, None, causal_mask, None, None)
-            context = context.transpose(0, 1).contiguous()
-            context = [c for c in context]
-        q_mask = torch.zeros((1, 1, 1, 21060), dtype=torch.bool).cuda()
-        kv_mask = torch.zeros((1, 1, 1, 512), dtype=torch.bool).cuda()
-        kv_mask_img = torch.zeros((1, 1, 1, 257), dtype=torch.bool).cuda()
-        context_mask = (q_mask, kv_mask, kv_mask_img)
-        hidden_state_seq_len = 21060
-        context_seqlen = 769
-
-        grid_sizes = torch.tensor([[ 6, 45, 78]], dtype=torch.int32).cuda()
-        output_tensor = model(x, t, context, context_mask, hidden_state_seq_len, context_seqlen, grid_sizes, None, clip_fea, y)
+            output_tensor = model(
+                tokens, position_ids, attention_mask, labels=labels, loss_mask=loss_mask
+            )
 
     # [ModelOpt]: model is needed to access ModelOpt distillation losses
     return output_tensor, partial(loss_func, loss_mask, model=model)
@@ -324,31 +299,31 @@ def is_dataset_built_on_rank():
     ) and parallel_state.get_tensor_model_parallel_rank() == 0
 
 
-# def core_gpt_dataset_config_from_args(args):
-#     tokenizer = get_tokenizer()
+def core_gpt_dataset_config_from_args(args):
+    tokenizer = get_tokenizer()
 
-#     # Sometimes --data-path is too long, instead we parse it from a file.
-#     blend: Optional[Tuple[List[str], Optional[List[float]]]]
-#     blend_per_split: Optional[List[Optional[Tuple[List[str], Optional[List[float]]]]]]
-#     blend, blend_per_split = get_blend_and_blend_per_split(args)
+    # Sometimes --data-path is too long, instead we parse it from a file.
+    blend: Optional[Tuple[List[str], Optional[List[float]]]]
+    blend_per_split: Optional[List[Optional[Tuple[List[str], Optional[List[float]]]]]]
+    blend, blend_per_split = get_blend_and_blend_per_split(args)
 
-#     return GPTDatasetConfig(
-#         random_seed=args.seed,
-#         sequence_length=args.seq_length,
-#         blend=blend,
-#         blend_per_split=blend_per_split,
-#         split=args.split,
-#         num_dataset_builder_threads=args.num_dataset_builder_threads,
-#         path_to_cache=args.data_cache_path,
-#         mmap_bin_files=args.mmap_bin_files,
-#         tokenizer=tokenizer,
-#         reset_position_ids=args.reset_position_ids,
-#         reset_attention_mask=args.reset_attention_mask,
-#         eod_mask_loss=args.eod_mask_loss,
-#         create_attention_mask=args.create_attention_mask_in_dataloader,
-#         object_storage_cache_path=args.object_storage_cache_path,
-#         mid_level_dataset_surplus=args.mid_level_dataset_surplus,
-#     )
+    return GPTDatasetConfig(
+        random_seed=args.seed,
+        sequence_length=args.seq_length,
+        blend=blend,
+        blend_per_split=blend_per_split,
+        split=args.split,
+        num_dataset_builder_threads=args.num_dataset_builder_threads,
+        path_to_cache=args.data_cache_path,
+        mmap_bin_files=args.mmap_bin_files,
+        tokenizer=tokenizer,
+        reset_position_ids=args.reset_position_ids,
+        reset_attention_mask=args.reset_attention_mask,
+        eod_mask_loss=args.eod_mask_loss,
+        create_attention_mask=args.create_attention_mask_in_dataloader,
+        object_storage_cache_path=args.object_storage_cache_path,
+        mid_level_dataset_surplus=args.mid_level_dataset_surplus,
+    )
 
 
 def train_valid_test_datasets_provider(train_val_test_num_samples):
@@ -359,57 +334,22 @@ def train_valid_test_datasets_provider(train_val_test_num_samples):
     """
     args = get_args()
 
-    # config = core_gpt_dataset_config_from_args(args)
+    config = core_gpt_dataset_config_from_args(args)
 
-    # if args.mock_data:
-    #     dataset_type = MockGPTDataset
-    # else:
-    #     dataset_type = GPTDataset
+    if args.mock_data:
+        dataset_type = MockGPTDataset
+    else:
+        dataset_type = GPTDataset
 
-    # print_rank_0("> building train, validation, and test datasets for GPT ...")
+    print_rank_0("> building train, validation, and test datasets for GPT ...")
 
-    # train_ds, valid_ds, test_ds = BlendedMegatronDatasetBuilder(
-    #     dataset_type, train_val_test_num_samples, is_dataset_built_on_rank, config
-    # ).build()
+    train_ds, valid_ds, test_ds = BlendedMegatronDatasetBuilder(
+        dataset_type, train_val_test_num_samples, is_dataset_built_on_rank, config
+    ).build()
 
-    # print_rank_0("> finished creating GPT datasets ...")
+    print_rank_0("> finished creating GPT datasets ...")
 
-    args.train_data_meta=/jizhicfs/marvinhjia/njw1123/test_data/test.json
-    args.train_data_dir=/jizhicfs/marvinhjia/njw1123/test_data
-    args.video_sample_size=960
-    args.video_sample_stride=2
-    args.video_sample_n_frames=81
-    args.video_repeat=1
-    args.image_sample_size=1024
-    args.enable_bucket=False
-    
-    train_dataset = ImageVideoDataset(
-        args.train_data_meta, args.train_data_dir,
-        video_sample_size=args.video_sample_size, video_sample_stride=args.video_sample_stride, video_sample_n_frames=args.video_sample_n_frames, 
-        video_repeat=args.video_repeat, 
-        image_sample_size=args.image_sample_size,
-        enable_bucket=args.enable_bucket, enable_inpaint=True if args.train_mode != "normal" else False,
-    )
-    
-    batch_sampler_generator = torch.Generator().manual_seed(args.seed)
-    dp_size = parallel_state.get_data_parallel_world_size()
-    mini_batch_size = args.mciro_batch_size * dp_size
-    batch_sampler = ImageVideoSampler(RandomSampler(train_dataset, generator=batch_sampler_generator), train_dataset, mini_batch_size)
-    train_dataloader = torch.utils.data.DataLoader(
-        train_dataset,
-        batch_sampler=batch_sampler, 
-        persistent_workers=True if args.dataloader_num_workers != 0 else False,
-        num_workers=args.dataloader_num_workers,
-        worker_init_fn=worker_init_fn(args.seed + accelerator.process_index)
-    )
-
-    return train_dataloader, train_dataloader, train_dataloader
-    
-
-
-    
-
-    # return train_ds, valid_ds, test_ds
+    return train_ds, valid_ds, test_ds
 
 
 if __name__ == "__main__":

@@ -1874,8 +1874,8 @@ def post_training_step_callbacks(
     ):
         if args.use_pytorch_profiler:
             assert prof is not None
-            # prof.export_memory_timeline(f"/nas/njw1123/add_dit/examples/video_fun/{f}.html", device="cuda:0")
-            prof.export_chrome_trace(f"/nas/njw1123/add_dit_new/examples/video_fun/prof/kernel_rank{args.rank}.json")
+            # prof.export_memory_timeline(f"/nas/njw1123/add_dit_new/examples/video_fun/prof/{args.rank}.html")
+            # prof.export_chrome_trace(f"/nas/njw1123/add_dit_new/examples/video_fun/prof/kernel_rank{args.rank}.json")
             prof.stop()
         else:
             torch.cuda.cudart().cudaProfilerStop()
@@ -2145,13 +2145,14 @@ def train(
                 active=args.profile_step_end - args.profile_step_start,
                 repeat=1,
             ),
-            # on_trace_ready=torch.profiler.tensorboard_trace_handler(args.tensorboard_dir),
+            on_trace_ready=torch.profiler.tensorboard_trace_handler(args.tensorboard_dir),
             activities=[
                 torch.profiler.ProfilerActivity.CPU,
                 torch.profiler.ProfilerActivity.CUDA,
             ],
             record_shapes=True,        # ✅ 记录每个 op 的张量 shape
-            # profile_memory=True,       # ✅ 显存分配 + 释放追踪
+            profile_memory=True,       # ✅ 显存分配 + 释放追踪
+            with_stack=True,
         )
         prof.start()
 

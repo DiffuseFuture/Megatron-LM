@@ -101,27 +101,6 @@ class L2Norm(torch.nn.Module):
         """
         return self._norm(x)
 
-
-
-# class WanRMSNorm(torch.nn.Module):
-
-#     def __init__(self, config, hidden_size):
-#         super().__init__()
-#         self.hidden_size = hidden_size
-#         self.eps = config.layernorm_epsilon
-#         self.weight = nn.Parameter(torch.ones(hidden_size))
-
-#     def forward(self, x):
-#         r"""
-#         Args:
-#             x(Tensor): Shape [B, L, C]
-#         """
-#         return self._norm(x.float()).type_as(x) * self.weight
-
-#     def _norm(self, x):
-#         return x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + self.eps)
-
-
 class WanLayerNorm(torch.nn.LayerNorm):
 
     def __init__(self, config, hidden_size):

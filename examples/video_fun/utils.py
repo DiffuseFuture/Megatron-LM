@@ -49,8 +49,8 @@ def resize_mask(mask, latent, process_first_frame_only=True):
 
 def get_timesteps_and_sigmas(noise_scheduler, bs, n_dim=4, dtype=torch.float32):
     args = get_args()
-    args.train_sampling_steps = 1000
     idx_sampling = DiscreteSampling(args.train_sampling_steps, uniform_sampling=True)
+    device = torch.cuda.current_device()
     indices = idx_sampling(bs, generator=None).cuda()
     indices = indices.long().cpu()
     timesteps = noise_scheduler.timesteps[indices].cuda()

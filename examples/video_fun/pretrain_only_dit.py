@@ -225,8 +225,8 @@ def model_provider(
 
     global dit_model
     config.text_dim = wan_config['text_encoder_kwargs'].get('dim')
-    config.cpu_offloading = args.cpu_offloading
-    config.cpu_offloading_num_layers = args.cpu_offloading_num_layers
+    # config.cpu_offloading = args.cpu_offloading
+    # config.cpu_offloading_num_layers = args.cpu_offloading_num_layers
     dit_model = WanTransformer3DModel(
         config=config,
         transformer_layer_spec=transformer_layer_spec,
@@ -338,7 +338,6 @@ def forward_step(data_iterator, model: WanTransformer3DModel):
     """
     args = get_args()
     timers = get_timers()
-    weight_dtype = torch.float16
     global sigmas
 
     
@@ -357,20 +356,24 @@ def forward_step(data_iterator, model: WanTransformer3DModel):
 
     with stimer:
         with torch.no_grad():
+            
 
             text = ["The video depicts a woman behind the wheel of a car, her long, dark hair shoulder-length and slightly tousled, catching the light as it gently illuminates her face and the edges of her hair, giving it a soft, almost ethereal glow. She sits near the steering wheel, her fingers resting lightly on the wheel, her posture relaxed yet alert, as if she's fully engaged in the journey ahead. The car is in motion, with a blurred landscape of majestic mountains and lush greenery passing by the window, the colors vibrant and the textures rich, creating a sense of movement and depth. The mountains, with their rugged peaks and rolling slopes, are bathed in the warm hues of the setting sun, casting long shadows and adding a dramatic touch to the scene. The greenery, a mix of dense forests and rolling hills, is alive with the promise of new growth and the tranquility of nature."]
             # 设置 dtype 为 bfloat16
             dtype = torch.bfloat16
             device = torch.cuda.current_device()
+            
 
-            latents = torch.randint(0, 2, ([1, 16, 6, 64, 156]), dtype=dtype, device=device, requires_grad=False)
-            inpaint_latents = torch.randint(0, 2, ([1, 20, 6, 64, 156]), dtype=dtype, device=device, requires_grad=False)
+            # 1, 81, 3, 720, 1248
+           # [1, 81, 3, 704, 1216])
+            latents = torch.randint(0, 2, ([1, 16, 21, 88, 152]), dtype=dtype, device=device, requires_grad=False)
+            inpaint_latents = torch.randint(0, 2, ([1, 20, 21, 88, 152]), dtype=dtype, device=device, requires_grad=False)
             clip_context = torch.randint(0, 2, ([1, 257, 1280]), dtype=dtype, device=device, requires_grad=False)
             context = torch.randint(0, 2, ([1, 257, 4096]), dtype=dtype, device=device, requires_grad=False)
     
             # noise
-            noise = torch.randn(latents.size(), device=latents.device, generator=None, dtype=weight_dtype)
-            timestep, sigmas = get_timesteps_and_sigmas(noise_scheduler, args.micro_batch_size, n_dim=5, dtype=weight_dtype)
+            noise = torch.randn(latents.size(), device=latents.device, generator=None, dtype=dtype)
+            timestep, sigmas = get_timesteps_and_sigmas(noise_scheduler, args.micro_batch_size, n_dim=5, dtype=dtype)
             noisy_latents = (1.0 - sigmas) * latents + sigmas * noise
     
             target = noise - latents

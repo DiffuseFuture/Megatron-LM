@@ -10,10 +10,13 @@ export TRANSFORMER_ENGINE_SKIP_UB=1
 
 GPUS_PER_NODE=8
 # Change for multinode config
-NODE_RANK=$MLP_ROLE_INDEX
+# NODE_RANK=$MLP_ROLE_INDEX
+NODE_RANK=0
 
-MASTER_ADDR=$MLP_WORKER_0_HOST
+# MASTER_ADDR=$MLP_WORKER_0_HOST
 MASTER_PORT=$MLP_WORKER_0_PORT
+MASTER_ADDR=localhost
+# MASTER_PORT=23457
 NUM_NODES=1
 WORLD_SIZE=$(($GPUS_PER_NODE*$NUM_NODES))
 
@@ -44,7 +47,7 @@ GPT_MODEL_ARGS=(
 
 TRAINING_ARGS=(
     --micro-batch-size 1
-    --global-batch-size 16
+    --global-batch-size 2
     --train-iters 10
     --weight-decay 0.1 
     --adam-beta1 0.9 
@@ -62,21 +65,22 @@ TRAINING_ARGS=(
     --untie-embeddings-and-output-weights
     --moe-token-dispatcher-type "alltoall"
     # --optimizer-cpu-offload
-    # --cpu_offloading
-    # --cpu_offloading_num_layers 39
-    # --recompute-granularity 'selective'
+    --recompute-granularity 'full'
+    --recompute-method "block"
+    --recompute-num-layers 40
     # --recompute-modules layernorm mlp
     # --profile
     # --recompute-modules mlp
     # --log-memory-to-tensorboard
-    # --use-distributed-optimizer
+    --data-parallel-random-init
+    # --use-distributed-optimizer\
 )
 
 MODEL_PARALLEL_ARGS=(
         # --tensor-model-parallel-size 8
         # --pipeline-model-parallel-size 1
         # --context-parallel-size 1
-        --tensor-model-parallel-size 8
+        --tensor-model-parallel-size 4
         --sequence-parallel
         # --tp-comm-overlap
         # --overlap-grad-reduce
@@ -99,7 +103,7 @@ DATA_ARGS=(
     --variable_seq_lengths
     --token_sample_size 960
     --dataloader-type cyclic
-    --dataloader_num_workers 12
+    --dataloader_num_workers 0
 )
 
 EVAL_AND_LOGGING_ARGS=(
@@ -111,11 +115,11 @@ EVAL_AND_LOGGING_ARGS=(
     --eval-iters 10
     --profile
     # --profile-ranks 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15
-    # --profile-ranks 0 1 2 3 4 5 6 7
-    # --use-pytorch-profiler
-    # --profile-step-start 2
-    # --profile-step-end   3
-    # --tensorboard-dir $TENSORBOARD_LOGS_PATH
+    --profile-ranks 0 1 2 3 4 5 6 7
+    --use-pytorch-profiler
+    --profile-step-start 2
+    --profile-step-end   3
+    --tensorboard-dir $TENSORBOARD_LOGS_PATH
 )
 
 torchrun ${DISTRIBUTED_ARGS[@]} /nas/njw1123/add_dit_new/examples/video_fun/pretrain_only_dit.py \
