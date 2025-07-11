@@ -965,7 +965,7 @@ class Transformer3dLayer(MegatronModule, BaseTransformerLayer):
             submodules.pre_cross_attn_layernorm,
             config=self.config,
             hidden_size=self.config.hidden_size,
-            eps=self.config.layernorm_epsilon,
+            elementwise_affine = True,
         )
 
         # [Module 5: CrossAttention]
@@ -1121,7 +1121,8 @@ class Transformer3dLayer(MegatronModule, BaseTransformerLayer):
         else:
             input_layernorm_output = self.input_layernorm(hidden_states)
         
-        # input_layernorm_output = input_layernorm_output * (1 + e[1]) + e[0]
+        input_layernorm_output = input_layernorm_output * (1 + e[1]) + e[0]
+        input_layernorm_output = input_layernorm_output.to(hidden_states.dtype)
         # Self attention.
         nvtx_range_push(suffix="self_attention")
         attention_output_with_bias = self.self_attention(
@@ -1150,7 +1151,7 @@ class Transformer3dLayer(MegatronModule, BaseTransformerLayer):
         #     )
         # nvtx_range_pop(suffix="self_attn_bda")
 
-        hidden_states = hidden_states + residual * e[2]
+        hidden_states = hidden_states + (attention_output_with_bias[0] + attention_output_with_bias[1]) * e[2]
 
         # Residual connection.
         residual = hidden_states
@@ -1165,7 +1166,7 @@ class Transformer3dLayer(MegatronModule, BaseTransformerLayer):
             key_value_states=context,
         )
 
-        hidden_states = attention_output_with_bias[0] + residual
+        hidden_states = attention_output_with_bias[0] + attention_output_with_bias[1] + residual
 
         # TODO: could we move `bias_dropout_add_exec_handler` itself
         # inside the module provided in the `bias_dropout_add_spec` module?
@@ -1251,7 +1252,7 @@ class Transformer3dLayer(MegatronModule, BaseTransformerLayer):
             )
         nvtx_range_pop(suffix="mlp")
 
-        hidden_states = mlp_output_with_bias[0] + residual * e[5]
+        hidden_states = (mlp_output_with_bias[0] + mlp_output_with_bias[1]) * e[5] + residual
 
         # Jit compiled function creates 'view' tensor. This tensor
         # potentially gets saved in the MPU checkpoint function context,
