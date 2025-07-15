@@ -390,8 +390,8 @@ class WanTransformer3DModel(LanguageModule):
             
         with amp.autocast(dtype=torch.float32):
             e = self.time_embedding(
-                sinusoidal_embedding_1d(self.freq_dim, t).float()).to(torch.bfloat16)
-            e0 = self.time_projection(e).unflatten(1, (6, self.hidden_size)).to(torch.bfloat16)
+                sinusoidal_embedding_1d(self.freq_dim, t).float())#.to(torch.bfloat16)
+            e0 = self.time_projection(e).unflatten(1, (6, self.hidden_size)) # .to(torch.bfloat16)
 
 
         if self.freqs.device == torch.device('cpu'):
@@ -415,6 +415,7 @@ class WanTransformer3DModel(LanguageModule):
         if parallel_state.is_pipeline_last_stage():
             x = self.head(x, e)
             x = x.transpose(0, 1).contiguous()
+            print(f"megatron x : {x} {x.shape}")
             weighting = compute_loss_weighting_for_sd3(weighting_scheme=None, sigmas=sigmas)
             loss = custom_mse_loss(x.to(torch.float32), target.to(torch.float32), weighting.to(torch.float32))
             return loss

@@ -102,6 +102,7 @@ def get_transformer3d_transformer_engine_block_spec(
                     k_layernorm=WanRMSNorm,
                 ),
             ),
+            pre_cross_attn_layernorm=WanLayerNorm,
             cross_attention=ModuleSpec(
                 module=WanCrossAttention,
                 params={"attn_mask_type": AttnMaskType.no_mask},
@@ -179,6 +180,7 @@ def get_transformer3d_layer_local_spec(
                     k_layernorm=WanRMSNorm,
                 ),
             ),
+            pre_cross_attn_layernorm=WanLayerNorm,
             cross_attention=ModuleSpec(
                 module=WanCrossAttention,
                 params={"attn_mask_type": AttnMaskType.padding},
@@ -239,7 +241,7 @@ def get_mlp_module_spec(
     return ModuleSpec(
         module=MLP,
         submodules=MLPSubmodules(
-            linear_fc1=TELayerNormColumnParallelLinear if use_te else ColumnParallelLinear,
+            linear_fc1=TEColumnParallelLinear if use_te else ColumnParallelLinear,
             linear_fc2=TERowParallelLinear if use_te else RowParallelLinear,
         ),
     )

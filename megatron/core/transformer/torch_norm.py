@@ -103,11 +103,11 @@ class L2Norm(torch.nn.Module):
 
 class WanLayerNorm(torch.nn.LayerNorm):
 
-    def __init__(self, config, hidden_size):
-        super().__init__(hidden_size, elementwise_affine=False, eps=config.layernorm_epsilon)
+    def __init__(self, config, hidden_size, elementwise_affine=False):
+        super().__init__(hidden_size, elementwise_affine=elementwise_affine, eps=config.layernorm_epsilon)
 
     def forward(self, x):
-        r"""
+        r""" 
         Args:
             x(Tensor): Shape [B, L, C]
         """
