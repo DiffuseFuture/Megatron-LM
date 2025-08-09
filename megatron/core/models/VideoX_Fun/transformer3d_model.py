@@ -20,6 +20,7 @@ from megatron.core.models.common.embeddings.rotary_pos_embedding import (
 )
 from diffusers.training_utils import compute_loss_weighting_for_sd3
 from megatron.core.models.common.language_module.language_module import LanguageModule
+from megatron.core.models.common.vision_module.vision_module import VisionModule
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.transformer.enums import ModelType
 from megatron.core.transformer.multi_token_prediction import (
@@ -116,7 +117,7 @@ def sinusoidal_embedding_1d(dim, position):
 
 
 
-class WanTransformer3DModel(LanguageModule):
+class WanTransformer3DModel(VisionModule):
     """GPT Transformer language model.
 
     Args:
@@ -415,7 +416,7 @@ class WanTransformer3DModel(LanguageModule):
         if parallel_state.is_pipeline_last_stage():
             x = self.head(x, e)
             x = x.transpose(0, 1).contiguous()
-            print(f"megatron x : {x} {x.shape}")
+            # print(f"megatron x : {x} {x.shape}")
             weighting = compute_loss_weighting_for_sd3(weighting_scheme=None, sigmas=sigmas)
             loss = custom_mse_loss(x.to(torch.float32), target.to(torch.float32), weighting.to(torch.float32))
             return loss
@@ -445,54 +446,3 @@ class WanTransformer3DModel(LanguageModule):
         elif self.post_process:
             return self.output_layer.weight
         return None
-
-    def sharded_state_dict(
-        self, prefix: str = '', sharded_offsets: tuple = (), metadata: Optional[Dict] = None
-    ) -> ShardedStateDict:
-        """Sharded state dict implementation for GPTModel backward-compatibility.
-
-        Removing extra state.
-        Tie word embeddings and output layer in mtp process stage.
-
-        Args:
-            prefix (str): Module name prefix.
-            sharded_offsets (tuple): PP related offsets, expected to be empty at this module level.
-            metadata (Optional[Dict]): metadata controlling sharded state dict creation.
-
-        Returns:
-            ShardedStateDict: sharded state dict for the GPTModel
-        """
-        sharded_state_dict = super().sharded_state_dict(prefix, sharded_offsets, metadata)
-        output_layer_extra_state_key = f'{prefix}output_layer._extra_state'
-
-        # Old GPT checkpoints only stored the output layer weight key. So we remove the
-        # _extra_state key but check that it doesn't contain any data anyway
-        output_extra_state = sharded_state_dict.pop(output_layer_extra_state_key, None)
-        assert not (
-            output_extra_state and output_extra_state.data
-        ), f'Expected output layer extra state to be empty, got: {output_extra_state}'
-
-        # Multi-Token Prediction (MTP) need both embedding layer and output layer in
-        # mtp process stage.
-        # If MTP is not placed in the pre processing stage, we need to maintain a copy of
-        # embedding layer in the mtp process stage and tie it to the embedding in the pre
-        # processing stage.
-        # Also, if MTP is not placed in the post processing stage, we need to maintain a copy
-        # of output layer in the mtp process stage and tie it to the output layer in the post
-        # processing stage.
-        if self.mtp_process and not self.pre_process:
-            emb_weight_key = f'{prefix}embedding.word_embeddings.weight'
-            emb_weight = self.embedding.word_embeddings.weight
-            tie_word_embeddings_state_dict(sharded_state_dict, emb_weight, emb_weight_key)
-        if self.mtp_process and not self.post_process:
-            # We only need to tie the output layer weight if share_embeddings_and_output_weights
-            # is False. Because if share_embeddings_and_output_weights is True, the shared weight
-            # will be stored in embedding layer, and output layer will not have any weight.
-            if not self.share_embeddings_and_output_weights:
-                output_layer_weight_key = f'{prefix}output_layer.weight'
-                output_layer_weight = self.output_layer.weight
-                tie_output_layer_state_dict(
-                    sharded_state_dict, output_layer_weight, output_layer_weight_key
-                )
-
-        return sharded_state_dict

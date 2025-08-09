@@ -16,6 +16,35 @@ cd Megatron-LM/examples/video_fun/
 bash train_only_dit.sh ## 参数含义可以参考megatron/training/arguments.py
 ```
 
+部分参数说明(可能需要修改的参数)：
+
+```shell
+NODE_RANK # 当前节点的rank
+MASTER_ADDR  # 主节点IP
+NUM_NODES # 节点数量
+
+--tensor-model-parallel-size  # tp大小
+--pretrained_model_path # 模型路径
+--transformer3d_config_path # 模型配置文件路径
+
+```
+
+### 模型转换
+
+转换脚本路径：
+
+``` shell
+Megatron-LM/examples/convert_WanDiT.sh
+Megatron-LM/examples/convert_WanDiT.py
+```
+
+需要修改convert_WanDiT.py中的参数设置模型读取和存储路径：
+
+```python
+dit_path = "path/to/Wan2.1-Fun-V1.1-14B-InP" # 原模型checkpoint的位置
+save_path = "path/to/dit" # megatron 格式的checkpoint的存储位置
+```
+
 ### Megatron 代码迁移与实现解析
 
 - 这部分主要介绍修改了megatron哪些部分的实现，直接拷贝原仓库实现的部分会进行省略，以及部分训练流程中的环节并没有修改，可以参考网上的Megatron源码解读理解

@@ -7,10 +7,11 @@ from megatron.core.jit import jit_fuser
 from megatron.core.transformer import TransformerConfig
 from megatron.core.utils import is_torch_min_version
 from megatron.core import parallel_state
-from megatron.core.utils import divide, get_tensor_model_parallel_group_if_none, is_torch_min_version
+from megatron.core.utils import divide, get_tensor_model_parallel_group_if_none, is_torch_min_version, make_tp_sharded_tensor_for_checkpoint
 from megatron.core.tensor_parallel.mappings import reduce_from_tensor_model_parallel_region
-from typing import Optional
-
+from ..dist_checkpointing.mapping import ShardedStateDict
+from ..transformer.utils import make_sharded_tensors_for_checkpoint
+from typing import Optional, Tuple
 
 class WrappedTorchNorm:
     """
@@ -147,3 +148,22 @@ class WanRMSNorm(torch.nn.Module):
             global_mean = x.pow(2).mean(dim=-1, keepdim=True) 
         
         return x * torch.rsqrt(global_mean + self.eps)
+        
+    def sharded_state_dict(
+        self,
+        prefix: str = '',
+        sharded_offsets: Tuple[Tuple[int, int, int]] = (),
+        metadata: Optional[dict] = None,
+    ) -> ShardedStateDict:
+        """Non-default implementation for embeddings due to `allow_shape_mismatch` param"""
+        state_dict = self.state_dict(prefix='', keep_vars=True)
+
+        weight_prefix = f'{prefix}weight'
+        return {
+            weight_prefix: make_tp_sharded_tensor_for_checkpoint(
+                tensor=state_dict['weight'],
+                key=weight_prefix,
+                allow_shape_mismatch=True,
+                prepend_offsets=sharded_offsets,
+            )
+        }
