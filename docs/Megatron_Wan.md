@@ -34,8 +34,8 @@ NUM_NODES # 节点数量
 转换脚本路径：
 
 ``` shell
-Megatron-LM/examples/convert_WanDiT.sh
-Megatron-LM/examples/convert_WanDiT.py
+Megatron-LM/megatron/examples/video_fun/convert_WanDiT.sh
+Megatron-LM/megatron/examples/video_fun/convert_WanDiT.py
 ```
 
 需要修改convert_WanDiT.py中的参数设置模型读取和存储路径：
